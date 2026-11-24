@@ -1,13 +1,18 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   cargarRegistro, validarRegistro, resolverDelegacion, construirPrompt,
   archivosFueraDeRutas, archivosDeConfiguracion, subagenteNativo, extraerUso, tokensTotales, SALIDA,
 } from '../lib/registro.mjs';
-import { construirArgs } from '../lib/ejecutores/index.mjs';
-import { crearLectorAgy } from '../lib/ejecutores/antigravity.mjs';
+import {
+  construirArgs, EJECUTORES, ejecutorRequerido, catalogoContiene, salidaJsonEfectiva,
+} from '../lib/ejecutores/index.mjs';
+import { crearLectorAgy, antigravity } from '../lib/ejecutores/antigravity.mjs';
+import { commandCode } from '../lib/ejecutores/command-code.mjs';
 import { calcularScorecard } from '../comandos/scorecard.mjs';
 import { crearLectorJson } from '../lib/salida-cmd.mjs';
 import { buscarTarea, tareaDe } from '../lib/tareas.mjs';
@@ -15,6 +20,11 @@ import { buscarTarea, tareaDe } from '../lib/tareas.mjs';
 const RUTA = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'models.yaml');
 const base = () => ({ ...structuredClone(cargarRegistro(RUTA)), repo: { sensible: false } });
 const ID = 'deepseek/deepseek-v4.1-flash-fast';
+const tempDirs = [];
+
+after(() => {
+  for (const d of tempDirs) fs.rmSync(d, { recursive: true, force: true });
+});
 
 test('el models.yaml incluido es válido', () => {
   assert.doesNotThrow(() => cargarRegistro(RUTA));
@@ -306,4 +316,221 @@ test('el scorecard sugiere promover, degradar y sumar un segundo modelo', () => 
   s = calcularScorecard(malas, r);
   assert.ok(s.sugerencias.some((x) => x.startsWith(`Pasar ${ID} a en_prueba`)));
   assert.ok(s.sugerencias.some((x) => x.includes('Rol "implementar"')));
+});
+
+test('rechaza claves desconocidas anidadas y valida preparar_con_credenciales', () => {
+  const casos = [
+    [(r) => { r.sandbox.escrituras_extra = []; }, /Claves desconocidas en sandbox: escrituras_extra/],
+    [(r) => { r.antigravity.cuenta_personal = true; }, /Claves desconocidas en antigravity: cuenta_personal/],
+    [(r) => { r.command_code.habilitar_skills = true; }, /Claves desconocidas en command_code: habilitar_skills/],
+    [(r) => { r.repos_sensibles.carpetas = []; }, /Claves desconocidas en repos_sensibles: carpetas/],
+    [(r) => { r.worktrees.carpeta = '~/x'; }, /Claves desconocidas en worktrees: carpeta/],
+    [(r) => { r.models[ID].extra = 1; }, new RegExp(`Claves desconocidas en models\\.${ID}: extra`)],
+    [(r) => { r.roles.implementar.extra = 1; }, /Claves desconocidas en roles\.implementar: extra/],
+    [(r) => { r.umbrales.extra = 1; }, /Claves desconocidas en umbrales: extra/],
+    [(r) => { r.umbrales.promocion.extra = 1; }, /Claves desconocidas en umbrales\.promocion: extra/],
+    [(r) => { r.umbrales.degradacion.extra = 1; }, /Claves desconocidas en umbrales\.degradacion: extra/],
+    [(r) => { r.umbrales.segundo_modelo.extra = 1; }, /Claves desconocidas en umbrales\.segundo_modelo: extra/],
+    [(r) => { r.sandbox.preparar_con_credenciales = 'si'; }, /sandbox\.preparar_con_credenciales debe ser true o false/],
+  ];
+  for (const [romper, error] of casos) {
+    const r = base();
+    romper(r);
+    assert.throws(() => validarRegistro(r), error);
+  }
+});
+
+test('rechaza secciones no-objeto (repos_sensibles, worktrees, ejecutores, sandbox, umbrales) y acepta null', () => {
+  for (const [romper, error] of [
+    [(r) => { r.repos_sensibles = []; }, /repos_sensibles debe ser un objeto/],
+    [(r) => { r.repos_sensibles = 'ninguno'; }, /repos_sensibles debe ser un objeto/],
+    [(r) => { r.worktrees = []; }, /worktrees debe ser un objeto/],
+    [(r) => { r.worktrees = 'repo'; }, /worktrees debe ser un objeto/],
+    [(r) => { r.command_code = 'cmd'; }, /command_code debe ser un objeto/],
+    [(r) => { r.antigravity = 42; }, /antigravity debe ser un objeto/],
+    [(r) => { r.sandbox = true; }, /sandbox debe ser un objeto/],
+    [(r) => { r.umbrales = []; }, /umbrales debe ser un objeto/],
+  ]) {
+    const r = base();
+    romper(r);
+    assert.throws(() => validarRegistro(r), error);
+  }
+  const conNulos = base();
+  conNulos.repos_sensibles = null;
+  conNulos.worktrees = null;
+  conNulos.sandbox = null;
+  conNulos.antigravity = null;
+  assert.doesNotThrow(() => validarRegistro(conNulos));
+});
+
+test('command_code soporta mapa opcional efforts:, rechaza mezclarlo con efforts_aceptados y traduce effort_cli', () => {
+  const r = base();
+  delete r.models[ID].efforts_aceptados;
+  r.models[ID].efforts = { off: 'none', low: 'low', high: 'high', max: 'xhigh' };
+  assert.doesNotThrow(() => validarRegistro(r));
+
+  const res1 = resolverDelegacion(r, { rol: 'implementar', intento: 1 });
+  assert.equal(res1.effort, 'high');
+  assert.equal(res1.effort_cli, 'high');
+  assert.equal(res1.slug, null);
+
+  const res2 = resolverDelegacion(r, { rol: 'implementar', intento: 2 });
+  assert.equal(res2.effort, 'max');
+  assert.equal(res2.effort_cli, 'xhigh');
+  assert.deepEqual(construirArgs(res2), ['-p', '--model', ID, '--effort', 'xhigh', '--yolo', '--skip-onboarding']);
+
+  const lectura = resolverDelegacion(r, { rol: 'analizar' });
+  assert.deepEqual(commandCode.args(lectura, [], { plan: true, sinSesion: true }), [
+    '-p', '--model', ID, '--effort', 'low', '--plan', '--no-session', '--no-auto-update', '--skip-onboarding',
+  ]);
+  assert.ok(!commandCode.args(res1, [], { plan: true }).includes('--plan'), 'solo lectura usa --plan');
+
+  for (const [romper, error] of [
+    [(m) => { m.efforts_aceptados = ['high']; }, /declara `efforts` o `efforts_aceptados`, no ambos/],
+    [(m) => { m.efforts = {}; }, /efforts debe mapear cada nivel de effort de orq a un nivel de cmd/],
+    [(m) => { m.efforts.high = 3; }, /efforts\.high debe ser un nivel de effort de cmd/],
+    [(m) => { delete m.efforts.max; }, /effort_reintento = "max" no está en models\..*\.efforts/],
+  ]) {
+    const mal = structuredClone(r);
+    romper(mal.models[ID]);
+    assert.throws(() => validarRegistro(mal), error);
+  }
+});
+
+test('ejecutorRequerido, catalogoContiene (token completo) y salidaJsonEfectiva', () => {
+  const r = base();
+  assert.equal(ejecutorRequerido(r, EJECUTORES.command_code), true);
+  assert.equal(ejecutorRequerido(r, EJECUTORES.antigravity), false);
+  r.roles.frontend.primario = 'antigravity/gemini-4-neon';
+  assert.equal(ejecutorRequerido(r, EJECUTORES.antigravity), true);
+  assert.equal(ejecutorRequerido({}, EJECUTORES.antigravity), false);
+
+  assert.equal(catalogoContiene('  deepseek/deepseek-v4.1-flash-fast\n', ID), true);
+  assert.equal(catalogoContiene('modelos: a, gemini-4-neon-low; otro', 'gemini-4-neon-low'), true);
+  assert.equal(catalogoContiene('gemini-4-neon-high-preview\ngemini-4-neon-xhigh', 'gemini-4-neon-high'), false);
+  assert.equal(catalogoContiene('deepseek/deepseek-v4.1-flash-fast-2', ID), false);
+  assert.equal(catalogoContiene('prefijo-deepseek/deepseek-v4.1-flash-fast', ID), false);
+  assert.equal(catalogoContiene('model-v4x1', 'model-v4.1'), false);
+  assert.equal(catalogoContiene('model-v4.1', 'model-v4.1'), true);
+  assert.equal(catalogoContiene('', ID), false);
+  assert.equal(catalogoContiene('abc', ''), false);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orq-reg-bins-'));
+  tempDirs.push(dir);
+  const crearBin = (nombre, script) => {
+    const p = path.join(dir, nombre);
+    fs.writeFileSync(p, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    return p;
+  };
+  const binNuevo = crearBin('cmd-nuevo', 'echo "1.84.0"');
+  const binViejo = crearBin('cmd-viejo', 'echo "0.26.21"');
+  const binFalla = crearBin('cmd-falla', 'echo "boom" >&2; exit 1');
+
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.antigravity, '/no/existe'), { activo: true, automatico: false, version: null });
+  r.command_code.salida_json = true;
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.command_code, '/no/existe'), { activo: true, automatico: false, version: null });
+  r.command_code.salida_json = false;
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.command_code, binNuevo), { activo: false, automatico: false, version: null });
+
+  r.command_code.salida_json = null;
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.command_code, binNuevo), { activo: true, automatico: true, version: '1.84.0' });
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.command_code, binViejo), { activo: false, automatico: false, version: '0.26.21' });
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.command_code, binFalla), { activo: false, automatico: false, version: null });
+  assert.deepEqual(salidaJsonEfectiva(r, EJECUTORES.command_code, path.join(dir, 'inexistente')), { activo: false, automatico: false, version: null });
+});
+
+test('salida-cmd (crearLectorJson): UTF-8 partido en chunks, max_turns, error, stdoutCola, coerción y alEvento', () => {
+  const eventos = [];
+  const l = commandCode.lector({ salida_json: true }, { alEvento: (ev) => eventos.push(ev) });
+  const lineaUtf8 = Buffer.from(
+    '{"type":"result","subtype":"success","finalText":"árbol ñandú 🚀 listo"}\n',
+    'utf8',
+  );
+  // Corta exactamente dentro de "á", "ñ" y "🚀" (4 bytes en UTF-8)
+  const posCohete = lineaUtf8.indexOf(Buffer.from('🚀', 'utf8'));
+  const cortes = [15, posCohete + 2];
+  l.agregar(lineaUtf8.subarray(0, cortes[0]));
+  l.agregar(lineaUtf8.subarray(cortes[0], cortes[1]));
+  l.agregar(lineaUtf8.subarray(cortes[1]));
+  assert.equal(l.terminar().texto, 'árbol ñandú 🚀 listo');
+
+  const mt = crearLectorJson({ alEvento: (ev) => eventos.push(ev) });
+  for (let i = 1; i <= 12; i++) mt.agregar(`  aviso ${i}  \n\n`);
+  mt.agregar('{"type":"event","event":{"type":"tool_running","toolName":"grep"}}\n');
+  mt.agregar('{"type":"result","subtype":"max_turns","finalText":42}');
+  const rMt = mt.terminar();
+  assert.equal(rMt.error, 'max_turns');
+  assert.equal(rMt.subtipo, 'max_turns');
+  assert.equal(rMt.texto, '42');
+  assert.deepEqual(rMt.stdoutCola, Array.from({ length: 10 }, (_, idx) => `aviso ${idx + 3}`));
+  assert.deepEqual(eventos, [{ tipo: 'herramienta', nombre: 'grep' }]);
+
+  const errTop = crearLectorJson();
+  errTop.agregar('{"type":"error","error":{"message":"rate limit"}}\n');
+  const rErr = errTop.terminar();
+  assert.equal(rErr.error, 'rate limit');
+  assert.equal(rErr.texto, '');
+
+  const nulo = crearLectorJson();
+  nulo.agregar('{"type":"result","subtype":"success","finalText":null}\n');
+  assert.equal(nulo.terminar().texto, '');
+});
+
+test('antigravity (crearLectorAgy y adaptador): UTF-8 partido, error sin result, stdoutCola, coerción, alEvento y settings', () => {
+  const eventos = [];
+  const l = antigravity.lector({}, { alEvento: (ev) => eventos.push(ev) });
+  const linea = Buffer.from('{"event":"result","result":{"status":"SUCCESS","response":"café ñandú 🚀"}}\n', 'utf8');
+  const posCohete = linea.indexOf(Buffer.from('🚀', 'utf8'));
+  l.agregar(Buffer.from('{"event":"step_update","step_update":{"state":"ACTIVE","tool_name":"read_file"}}\n', 'utf8'));
+  l.agregar(Buffer.from('{"event":"step_update","step_update":{"state":"DONE","tool_name":"read_file"}}\n', 'utf8'));
+  l.agregar(linea.subarray(0, posCohete + 1));
+  l.agregar(linea.subarray(posCohete + 1, posCohete + 3));
+  l.agregar(linea.subarray(posCohete + 3));
+  const res = l.terminar();
+  assert.equal(res.texto, 'café ñandú 🚀');
+  assert.deepEqual(res.herramientas, { read_file: 1 });
+  assert.deepEqual(eventos, [
+    { tipo: 'herramienta', nombre: 'read_file' },
+    { tipo: 'herramienta', nombre: 'read_file' },
+  ]);
+
+  const errSinRes = crearLectorAgy();
+  for (let i = 1; i <= 11; i++) errSinRes.agregar(`stderr-en-stdout ${i}\n`);
+  errSinRes.agregar('{"event":"error","error":{"message":"token expirado"}}\n');
+  const rErr = errSinRes.terminar();
+  assert.equal(rErr.error, 'token expirado');
+  assert.equal(rErr.texto, '');
+  assert.deepEqual(rErr.stdoutCola, Array.from({ length: 10 }, (_, idx) => `stderr-en-stdout ${idx + 2}`));
+
+  const numResp = crearLectorAgy();
+  numResp.agregar('{"event":"result","result":{"status":"FAILED","response":99}}\n');
+  const rNum = numResp.terminar();
+  assert.equal(rNum.texto, '99');
+  assert.equal(rNum.error, 'estado FAILED');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orq-agy-unit-'));
+  tempDirs.push(dir);
+  const badSettings = path.join(dir, 'settings.json');
+  fs.writeFileSync(badSettings, '{ invalido');
+  const prevSettings = process.env.ORQ_AGY_SETTINGS;
+  const prevAgyBin = process.env.ORQ_AGY_BIN;
+  const prevCmdBin = process.env.ORQ_CMD_BIN;
+  try {
+    process.env.ORQ_AGY_SETTINGS = badSettings;
+    process.env.ORQ_AGY_BIN = '~/bin/agy';
+    process.env.ORQ_CMD_BIN = '~/bin/cmd';
+    assert.equal(antigravity.bin({}), path.join(os.homedir(), 'bin', 'agy'));
+    assert.equal(commandCode.bin({}), path.join(os.homedir(), 'bin', 'cmd'));
+    const acc = antigravity.acceso({ antigravity: { permitir_cuenta_personal: false } });
+    assert.equal(acc.modo, 'cuenta_personal');
+    assert.match(acc.avisoSettings, /no es JSON válido/);
+    assert.ok(acc.bloqueo);
+  } finally {
+    if (prevSettings === undefined) delete process.env.ORQ_AGY_SETTINGS;
+    else process.env.ORQ_AGY_SETTINGS = prevSettings;
+    if (prevAgyBin === undefined) delete process.env.ORQ_AGY_BIN;
+    else process.env.ORQ_AGY_BIN = prevAgyBin;
+    if (prevCmdBin === undefined) delete process.env.ORQ_CMD_BIN;
+    else process.env.ORQ_CMD_BIN = prevCmdBin;
+  }
 });

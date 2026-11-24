@@ -27,8 +27,20 @@ IFS=$OLD_IFS
 solo_consulta=0
 solo_clean=0
 compila=0
+skip_next=0
 for arg in "$@"; do
+  if [ "$skip_next" -eq 1 ]; then
+    skip_next=0
+    continue
+  fi
   case "$arg" in
+    -project|-workspace|-scheme|-configuration|-destination|-derivedDataPath|-resultBundlePath|\
+    -archivePath|-exportPath|-exportOptionsPlist|-sdk|-arch|-jobs|-xcconfig|-toolchain|-xctestrun|\
+    -only-testing|-skip-testing|-testPlan|-parallel-testing-enabled|\
+    -maximum-concurrent-test-device-destinations|-clonedSourcePackagesDirPath|-packageCachePath|\
+    -IDECustomBuildIntermediatesPath|-target|-destination-timeout)
+      skip_next=1
+      ;;
     -version|-help|-usage|-list|-showsdks|-showdestinations|-showBuildSettings|-showBuildSettingsForIndex|\
     -showTestPlans|-license|-checkFirstLaunchStatus|-runFirstLaunch|-exportArchive|-exportNotarizedApp|\
     -exportLocalizations|-importLocalizations|-create-xcframework|-resolvePackageDependencies|\

@@ -21,7 +21,9 @@ test('ciclo completo: delegar, revisar, continuar, escalar, integrar y limpiar',
   assert.equal(r.codigo, 0, r.error + r.salida);
 
   const [llamada] = llamadas(ctx);
-  assert.deepEqual(llamada.args, ['-p', '--model', 'deepseek/deepseek-v4.1-flash-fast', '--effort', 'high', '--yolo', '--skip-onboarding']);
+  assert.deepEqual(llamada.args, [
+    '-p', '--model', 'deepseek/deepseek-v4.1-flash-fast', '--effort', 'high', '--yolo', '--output-format', 'json', '--skip-onboarding',
+  ]);
   assert.match(llamada.cwd, /\.claude\/worktrees\//);
   assert.match(llamada.entrada, /rol: implementar · intento 1\/2/);
 
@@ -56,8 +58,11 @@ test('ciclo completo: delegar, revisar, continuar, escalar, integrar y limpiar',
   assert.equal(ev2.archivos_acumulados.length, 2);
   assert.equal(orq(ctx, ['revision', ev2.id, 'aprobado']).codigo, 0);
 
-  // el tercer intento no existe: orq escala solo, sin que Opus declare el número
-  const r3 = orq(ctx, ['delegar', 'implementar', '--continuar', ev.tarea], { entrada: 'x' });
+  // tarea ya resuelta: --continuar la rechaza salvo con --reabrir; el tercer intento escala solo
+  const r3Cerrada = orq(ctx, ['delegar', 'implementar', '--continuar', ev.tarea], { entrada: 'x' });
+  assert.equal(r3Cerrada.codigo, 2);
+  assert.match(r3Cerrada.error, /ya está cerrada \(estado: resuelta\).*--reabrir/);
+  const r3 = orq(ctx, ['delegar', 'implementar', '--continuar', ev.tarea, '--reabrir'], { entrada: 'x' });
   assert.equal(r3.codigo, 4);
   assert.match(r3.salida, /implementador-sonnet/);
   assert.match(r3.salida, new RegExp(`worktree .*${ev.tarea}`));
@@ -401,10 +406,13 @@ test('limpiar --descartar elimina una delegación sin integrar', () => {
   assert.equal(orq(ctx, ['limpiar', '--descartar', ev.id]).codigo, 0);
   assert.ok(!fs.existsSync(path.join(ctx.repo, ev.worktree)));
   assert.equal(orq(ctx, ['limpiar', '--descartar', 'no-existe']).codigo, 2);
-  // con el worktree eliminado, la tarea ya no se puede continuar
+  // con la tarea descartada, --continuar se rechaza salvo --reabrir (que luego detecta el worktree ausente)
   const r = orq(ctx, ['delegar', 'tests', '--continuar', ev.tarea], { entrada: 'x' });
   assert.equal(r.codigo, 2);
-  assert.match(r.error, /ya no existe/);
+  assert.match(r.error, /ya está cerrada \(estado: descartada\)/);
+  const rReabrir = orq(ctx, ['delegar', 'tests', '--continuar', ev.tarea, '--reabrir'], { entrada: 'x' });
+  assert.equal(rReabrir.codigo, 2);
+  assert.match(rReabrir.error, /ya no existe/);
 });
 
 test('orq init --sensible bloquea Command Code en el repo con el motivo', () => {
@@ -521,4 +529,330 @@ test('doctor reporta el estado del registro, el sandbox y el repo', () => {
   assert.match(r.salida, /Repo actual:/);
   fs.mkdirSync(path.join(ctx.repo, '.claude', 'orquestador', 'bin'), { recursive: true });
   assert.match(orq(ctx, ['doctor']).salida, /instalación por repo de la versión 0\.1/);
+});
+
+test('salida_json: false explícito desactiva --output-format json y entrega texto plano', () => {
+  const ctx = entorno({ editarRegistro: (y) => y.replace('salida_json: null', 'salida_json: false') });
+  const r = orq(ctx, ['delegar', 'implementar'], { entrada: 'x' });
+  assert.equal(r.codigo, 0, r.error + r.salida);
+  const [llamada] = llamadas(ctx);
+  assert.ok(!llamada.args.includes('--output-format'));
+  assert.equal(delegaciones(ctx)[0].uso, null);
+  assert.match(r.salida, /Archivos modificados: docs\/cambio\.md/);
+  assert.doesNotMatch(r.salida, /--- respuesta de Command Code ---/);
+  assert.match(orq(ctx, ['estado']).salida, /salida JSON no/);
+});
+
+test('--continuar rechaza tareas resueltas, escaladas y descartadas salvo con --reabrir', () => {
+  const ctx = entorno();
+  // 1. resuelta
+  assert.equal(orq(ctx, ['delegar', 'tests'], { entrada: 'x' }).codigo, 0);
+  const t1 = delegaciones(ctx)[0];
+  assert.equal(orq(ctx, ['revision', t1.id, 'aprobado']).codigo, 0);
+  const cRes = orq(ctx, ['delegar', 'tests', '--continuar', t1.tarea], { entrada: 'y' });
+  assert.equal(cRes.codigo, 2);
+  assert.match(cRes.error, /ya está cerrada \(estado: resuelta\)/);
+  const rRes = orq(ctx, ['delegar', 'tests', '--continuar', t1.tarea, '--reabrir'], { entrada: 'y' });
+  assert.equal(rRes.codigo, 0, rRes.error);
+  assert.equal(delegaciones(ctx).at(-1).intento, 2);
+
+  // 2. escalada
+  assert.equal(orq(ctx, ['delegar', 'tests'], { entrada: 'a' }).codigo, 0);
+  const t2 = delegaciones(ctx).at(-1);
+  assert.equal(orq(ctx, ['delegar', 'tests', '--continuar', t2.tarea], { entrada: 'b' }).codigo, 0);
+  assert.equal(orq(ctx, ['delegar', 'tests', '--continuar', t2.tarea], { entrada: 'c' }).codigo, 4);
+  const cEsc = orq(ctx, ['delegar', 'tests', '--continuar', t2.tarea], { entrada: 'd' });
+  assert.equal(cEsc.codigo, 2);
+  assert.match(cEsc.error, /ya está cerrada \(estado: escalada\)/);
+  const rEsc = orq(ctx, ['delegar', 'tests', '--continuar', t2.tarea, '--reabrir'], { entrada: 'd' });
+  assert.equal(rEsc.codigo, 4);
+
+  // 3. descartada
+  assert.equal(orq(ctx, ['delegar', 'tests'], { entrada: 'p' }).codigo, 0);
+  const t3 = delegaciones(ctx).at(-1);
+  assert.equal(orq(ctx, ['limpiar', '--descartar', t3.tarea]).codigo, 0);
+  const cDesc = orq(ctx, ['delegar', 'tests', '--continuar', t3.tarea], { entrada: 'q' });
+  assert.equal(cDesc.codigo, 2);
+  assert.match(cDesc.error, /ya está cerrada \(estado: descartada\)/);
+});
+
+test('--continuar sin <rol> ni --modelo hereda rol y modelo y avisa si el previo se retiró', () => {
+  const ctx = entorno({ editarRegistro: permitirCuentaPersonal });
+  assert.equal(orq(ctx, ['delegar', 'implementar', '--modelo', 'antigravity/gemini-4-neon'], { entrada: 'x' }).codigo, 0);
+  const [ev1] = delegaciones(ctx);
+
+  const r2 = orq(ctx, ['delegar', '--continuar', ev1.tarea], { entrada: 'y' });
+  assert.equal(r2.codigo, 0, r2.error + r2.salida);
+  const ev2 = delegaciones(ctx)[1];
+  assert.equal(ev2.rol, 'implementar');
+  assert.equal(ev2.modelo, 'antigravity/gemini-4-neon');
+  assert.equal(ev2.intento, 2);
+
+  // También funciona con --worktree omitiendo <rol> y si el modelo anterior se retira cae al primario con aviso
+  const yaml = fs.readFileSync(ctx.registro, 'utf8');
+  fs.writeFileSync(
+    ctx.registro,
+    yaml.replace(/(antigravity\/gemini-4-neon:[\s\S]*?estado: )en_prueba/, '$1retirado').replace('max_intentos: 2', 'max_intentos: 3'),
+  );
+  // Ajustar max_intentos en implementar específicamente (el primer max_intentos: 2 es de explorar)
+  const yaml2 = fs.readFileSync(ctx.registro, 'utf8')
+    .replace(/(implementar:[\s\S]*?max_intentos: )2/, '$13');
+  fs.writeFileSync(ctx.registro, yaml2);
+  const r3 = orq(ctx, ['delegar', '--worktree', ev1.worktree], { entrada: 'z' });
+  assert.equal(r3.codigo, 0, r3.error + r3.salida);
+  const ev3 = delegaciones(ctx)[2];
+  assert.equal(ev3.rol, 'implementar');
+  assert.equal(ev3.modelo, 'deepseek/deepseek-v4.1-flash-fast');
+  assert.match(r3.salida, /aviso: El intento anterior usó "antigravity\/gemini-4-neon", que ya no está disponible/);
+});
+
+test('--prompt-archivo válido, faltante y vacío; y --dry-run completo', () => {
+  const ctx = entorno();
+  const archivo = path.join(ctx.tmp, 'mi-prompt.md');
+  fs.writeFileSync(archivo, 'Implementa desde archivo.\n');
+
+  const dry = orq(ctx, ['delegar', 'implementar', '--prompt-archivo', archivo, '--dry-run']);
+  assert.equal(dry.codigo, 0, dry.error + dry.salida);
+  assert.match(dry.salida, /"ejecutor": "command_code"/);
+  assert.match(dry.salida, /Implementa desde archivo\./);
+  assert.ok(!fs.existsSync(ctx.llamadas));
+
+  const ok = orq(ctx, ['delegar', 'implementar', '--prompt-archivo', archivo]);
+  assert.equal(ok.codigo, 0, ok.error);
+  assert.match(llamadas(ctx)[0].entrada, /Implementa desde archivo\./);
+
+  const falta = orq(ctx, ['delegar', 'implementar', '--prompt-archivo', path.join(ctx.tmp, 'no-existe.md')]);
+  assert.equal(falta.codigo, 2);
+  assert.match(falta.error, /No se pudo leer --prompt-archivo/);
+  assert.doesNotMatch(falta.error, /\n\s+at /);
+
+  const vacio = orq(ctx, ['delegar', 'implementar', '--prompt-archivo', '']);
+  assert.equal(vacio.codigo, 2);
+  assert.match(vacio.error, /Indica la ruta del archivo/);
+});
+
+test('orq verificar --capacidades --guardar guarda capacidades rápido y rechaza --guardar --sin-llamadas', () => {
+  const ctx = entorno();
+  const inv1 = orq(ctx, ['verificar', '--guardar', '--sin-llamadas']);
+  assert.equal(inv1.codigo, 2);
+  assert.match(inv1.error, /--guardar.*--sin-llamadas/);
+  assert.equal(orq(ctx, ['verificar', '--capacidades', '--sin-llamadas']).codigo, 2);
+  assert.equal(orq(ctx, ['verificar', '--capacidades', '--ejecutor', 'antigravity']).codigo, 2);
+
+  const r = orq(ctx, ['verificar', '--capacidades', '--guardar'], { env: { ORQ_AGY_BIN: '/no/existe' } });
+  assert.equal(r.codigo, 0, r.salida + r.error);
+  assert.equal(llamadas(ctx).length, 2, 'solo prueba --skill y --output-format json en el modelo principal');
+  assert.doesNotMatch(r.salida, /Sandbox sandbox-exec/);
+  const yaml = fs.readFileSync(ctx.registro, 'utf8');
+  assert.match(yaml, /skills_compatibles: true/);
+  assert.match(yaml, /salida_json: true/);
+  assert.match(yaml, /# Registro global del orquestador/);
+});
+
+test('orq limpiar: excluidos de preparar, squash merge, --resueltas, carpeta eliminada, solo lectura y --logs', () => {
+  const ctx = entorno();
+
+  // 1. Archivos dejados por preparar (wt.excluir) no bloquean limpiar tras merge; archivo sucio extra sí bloquea
+  ajustesRepo(ctx, 'preparar:\n  - echo secreto=1 > .env.local\n');
+  assert.equal(orq(ctx, ['delegar', 'implementar'], { entrada: 'x' }).codigo, 0);
+  const [evPrep] = delegaciones(ctx);
+  git(ctx, 'merge', '-q', '--no-ff', '-m', 'merge prep', evPrep.rama);
+  fs.writeFileSync(path.join(ctx.repo, evPrep.worktree, 'sucio.txt'), 'sin commit\n');
+  const sucio = orq(ctx, ['limpiar']);
+  assert.equal(sucio.codigo, 1);
+  assert.match(sucio.error, /tiene cambios sin commit/);
+  fs.rmSync(path.join(ctx.repo, evPrep.worktree, 'sucio.txt'));
+  assert.equal(orq(ctx, ['limpiar']).codigo, 0);
+  assert.ok(!fs.existsSync(path.join(ctx.repo, evPrep.worktree)));
+
+  // 2. Clean squash merge se detecta automáticamente
+  ajustesRepo(ctx, 'preparar: []\n');
+  assert.equal(orq(ctx, ['delegar', 'implementar'], { entrada: 'squash' }).codigo, 0);
+  const evSq = delegaciones(ctx).at(-1);
+  git(ctx, 'merge', '--squash', '-q', evSq.rama);
+  git(ctx, 'commit', '-q', '-m', 'squash merge');
+  assert.match(orq(ctx, ['estado']).salida, /integrada \(orq limpiar\)/);
+  assert.match(orq(ctx, ['limpiar']).salida, /1 limpiado\(s\)/);
+
+  // 3. Squash con cambios divergentes posteriores requiere --resueltas (tras aprobar)
+  assert.equal(orq(ctx, ['delegar', 'implementar'], { entrada: 'div' }).codigo, 0);
+  const evRes = delegaciones(ctx).at(-1);
+  assert.equal(orq(ctx, ['revision', evRes.id, 'aprobado']).codigo, 0);
+  git(ctx, 'merge', '--squash', '-q', evRes.rama);
+  fs.writeFileSync(path.join(ctx.repo, evRes.archivos[0]), '# editado en main tras squash\n');
+  git(ctx, 'add', '-A');
+  git(ctx, 'commit', '-q', '-m', 'squash modificado');
+  assert.match(orq(ctx, ['limpiar']).salida, /0 limpiado\(s\); 1 sin integrar/);
+  assert.match(orq(ctx, ['limpiar', '--resueltas']).salida, /1 limpiado\(s\)/);
+  assert.ok(!git(ctx, 'branch', '--list', `delegar/${evRes.tarea}`).trim());
+
+  // 4. Carpeta del worktree borrada manualmente + --descartar
+  assert.equal(orq(ctx, ['delegar', 'tests'], { entrada: 'borrada' }).codigo, 0);
+  const evBorrada = delegaciones(ctx).at(-1);
+  fs.rmSync(path.join(ctx.repo, evBorrada.worktree), { recursive: true, force: true });
+  assert.match(orq(ctx, ['estado']).salida, /carpeta eliminada/);
+  const descBorrada = orq(ctx, ['limpiar', '--descartar', evBorrada.tarea]);
+  assert.equal(descBorrada.codigo, 0, descBorrada.error);
+  assert.equal(git(ctx, 'branch', '--list', `delegar/${evBorrada.tarea}`).trim(), '');
+
+  // 5. Tarea de solo lectura + --descartar + --logs (conserva tareas abiertas)
+  assert.equal(orq(ctx, ['delegar', 'analizar'], { entrada: 'lectura' }).codigo, 0);
+  const evLect = delegaciones(ctx).at(-1);
+  assert.equal(orq(ctx, ['delegar', 'tests'], { entrada: 'abierta' }).codigo, 0);
+  const evAbierta = delegaciones(ctx).at(-1);
+  const descLect = orq(ctx, ['limpiar', '--descartar', evLect.tarea, '--logs']);
+  assert.equal(descLect.codigo, 0, descLect.error);
+  assert.match(descLect.salida, /solo lectura/);
+  assert.match(descLect.salida, /Logs podados:/);
+  assert.doesNotMatch(orq(ctx, ['estado']).salida, /Tareas abiertas de solo lectura/);
+  assert.equal(JSON.parse(orq(ctx, ['estado', '--json']).salida).tareas_abiertas_lectura.length, 0);
+  assert.ok(fs.existsSync(path.join(ctx.datos, 'logs', 'salidas', `${evAbierta.id}.log`)), 'conserva logs de tarea abierta');
+  assert.ok(!fs.existsSync(path.join(ctx.datos, 'logs', 'salidas', `${evLect.id}.log`)), 'poda logs de tarea cerrada');
+});
+
+test('orq <cmd> --help, orq ayuda <cmd> y errores localizados de parseArgs', () => {
+  const ctx = entorno();
+  const cmds = ['delegar', 'revision', 'validar', 'ver', 'estado', 'init', 'limpiar', 'scorecard', 'verificar', 'doctor'];
+  for (const c of cmds) {
+    const h1 = orq(ctx, [c, '--help']);
+    assert.equal(h1.codigo, 0, `${c} --help: ${h1.error}`);
+    assert.match(h1.salida, new RegExp(`Uso: orq ${c}`));
+
+    const h2 = orq(ctx, ['ayuda', c]);
+    assert.equal(h2.codigo, 0, `ayuda ${c}: ${h2.error}`);
+    assert.match(h2.salida, new RegExp(`Uso: orq ${c}`));
+  }
+  assert.equal(orq(ctx, ['ayuda', 'inventado']).codigo, 2);
+
+  const errDesc = orq(ctx, ['estado', '--inventada']);
+  assert.equal(errDesc.codigo, 2);
+  assert.match(errDesc.error, /Opción desconocida: --inventada\. Usa: orq estado --help/);
+
+  const errFalta = orq(ctx, ['delegar', 'implementar', '--modelo']);
+  assert.equal(errFalta.codigo, 2);
+  assert.match(errFalta.error, /Falta el valor de la opción --modelo\. Usa: orq delegar --help/);
+
+  const errBool = orq(ctx, ['estado', '--resumen=1']);
+  assert.equal(errBool.codigo, 2);
+  assert.match(errBool.error, /La opción --resumen no admite valor\. Usa: orq estado --help/);
+
+  const errPos = orq(ctx, ['doctor', 'extra']);
+  assert.equal(errPos.codigo, 2);
+  assert.match(errPos.error, /Argumento inesperado "extra": este comando no recibe argumentos posicionales\. Usa: orq doctor --help/);
+});
+
+test('orq ver <tarea> con tabla de intentos, --prompt, --log y --json', () => {
+  const ctx = entorno();
+  assert.equal(orq(ctx, ['delegar', 'implementar', '--fase', 'Fase 2'], { entrada: 'Prompt uno.' }).codigo, 0);
+  const [ev1] = delegaciones(ctx);
+  assert.equal(orq(ctx, ['revision', ev1.id, 'corregido', '--nota', 'falta borde']).codigo, 0);
+  assert.equal(orq(ctx, ['delegar', '--continuar', ev1.tarea], { entrada: 'Prompt dos.' }).codigo, 0);
+  const ev2 = delegaciones(ctx)[1];
+
+  const ver = orq(ctx, ['ver', ev1.tarea, '--prompt', '--log']);
+  assert.equal(ver.codigo, 0, ver.error);
+  assert.match(ver.salida, new RegExp(`Tarea: ${ev1.tarea} · estado: abierta · rol: implementar · fase: Fase 2`));
+  assert.match(ver.salida, /Notas de revisión:\n {2}intento 1 \(corregido\): falta borde/);
+  assert.match(ver.salida, /Diff: git diff /);
+  assert.match(ver.salida, new RegExp(`--- prompt \\(${ev2.id}\\) ---[\\s\\S]*Prompt dos\\.`));
+  assert.match(ver.salida, new RegExp(`--- últimas 40 líneas de salida \\(${ev2.id}\\) ---`));
+
+  const json = JSON.parse(orq(ctx, ['ver', ev1.tarea, '--json', '--prompt', '--log']).salida);
+  assert.equal(json.tarea, ev1.tarea);
+  assert.equal(json.intento_consultado, ev2.id);
+  assert.equal(json.intentos.length, 2);
+  assert.equal(json.intentos[0].revision.nota, 'falta borde');
+  assert.match(json.prompt_texto, /Prompt dos\./);
+  assert.ok(Array.isArray(json.log_cola) && json.log_cola.length > 0);
+  assert.equal(orq(ctx, ['ver', 'no-existe']).codigo, 2);
+});
+
+test('orq init --sensible actualiza sin destruir ajustes y detecta sensibilidad global y .gitignore', () => {
+  const ctx = entorno();
+  ajustesRepo(ctx, [
+    'sensible: false # comentario',
+    'preparar:',
+    '  - echo prep',
+    'validar:',
+    '  - echo val',
+    'roles:',
+    '  tests:',
+    '    effort: high',
+    '',
+  ].join('\n'));
+  const upd = orq(ctx, ['init', '--sensible']);
+  assert.equal(upd.codigo, 0, upd.error);
+  assert.match(upd.salida, /Actualizado \.claude\/orquestador\.yaml \(sensible: true; se conservan los demás ajustes\)/);
+  const contenido = fs.readFileSync(path.join(ctx.repo, '.claude', 'orquestador.yaml'), 'utf8');
+  assert.match(contenido, /^sensible: true # comentario$/m);
+  assert.match(contenido, /echo prep/);
+  assert.match(contenido, /effort: high/);
+
+  const ctxGlobal = entorno({ editarRegistro: (y) => y.replace('remotos: []', 'remotos: ["*privado*"]') });
+  git(ctxGlobal, 'remote', 'add', 'origin', 'git@github.com:org/privado.git');
+  fs.writeFileSync(path.join(ctxGlobal.repo, '.gitignore'), '.claude/orquestador.yaml\n');
+  const ig = orq(ctxGlobal, ['init']);
+  assert.equal(ig.codigo, 0, ig.error);
+  assert.match(ig.salida, /inicializado con sensible: true/);
+  assert.match(ig.salida, /Aviso: \.claude\/orquestador\.yaml está ignorado por git/);
+  assert.doesNotMatch(ig.salida, /git add \.claude\/orquestador\.yaml/);
+});
+
+test('orq estado --resumen --json, tareas de lectura separadas y desactivado: true mantiene worktrees', () => {
+  const ctx = entorno();
+  assert.equal(orq(ctx, ['delegar', 'tests'], { entrada: 'w' }).codigo, 0);
+  assert.equal(orq(ctx, ['delegar', 'analizar'], { entrada: 'r' }).codigo, 0);
+  const [evW, evR] = delegaciones(ctx);
+
+  const completo = orq(ctx, ['estado']);
+  assert.match(completo.salida, new RegExp(`Tareas abiertas en este repo:[\\s\\S]*${evW.tarea}`));
+  assert.match(completo.salida, new RegExp(`Tareas abiertas de solo lectura:[\\s\\S]*${evR.tarea}`));
+
+  const res = orq(ctx, ['estado', '--resumen']);
+  assert.equal(res.codigo, 0, res.error);
+  assert.doesNotMatch(res.salida, /Roles \(valores efectivos/);
+  assert.doesNotMatch(res.salida, /Whitelist de modelos delegables/);
+  assert.doesNotMatch(res.salida, /Nunca se delegan:/);
+  assert.match(res.salida, /Worktrees de delegación: 1/);
+
+  const jsonRes = JSON.parse(orq(ctx, ['estado', '--resumen', '--json']).salida);
+  assert.equal(jsonRes.worktrees.length, 1);
+  assert.equal(jsonRes.tareas_abiertas.length, 1);
+  assert.equal(jsonRes.tareas_abiertas_lectura.length, 1);
+  assert.equal(jsonRes.roles, undefined);
+  assert.equal(jsonRes.models, undefined);
+
+  ajustesRepo(ctx, 'desactivado: true\n');
+  const des = orq(ctx, ['estado']);
+  assert.equal(des.codigo, 0);
+  assert.match(des.salida, /DESACTIVADO/);
+  assert.match(des.salida, /Worktrees de delegación: 1/);
+  assert.match(des.salida, new RegExp(`Tareas abiertas en este repo:[\\s\\S]*${evW.tarea}`));
+  const desJson = JSON.parse(orq(ctx, ['estado', '--json']).salida);
+  assert.equal(desJson.repo.desactivado, true);
+  assert.equal(desJson.worktrees.length, 1);
+});
+
+test('revision avisa al aprobar fallos o reemplazar revisión; scorecard valida fechas, --detalle y --repo', () => {
+  const ctx = entorno();
+  assert.equal(orq(ctx, ['delegar', 'implementar'], { entrada: 'x', modo: 'falla' }).codigo, 1);
+  const [ev] = delegaciones(ctx);
+
+  const apr = orq(ctx, ['revision', ev.id, 'aprobado']);
+  assert.equal(apr.codigo, 0);
+  assert.match(apr.salida, /Aviso: estás marcando como aprobado un intento con exit_code 1/);
+
+  const rep = orq(ctx, ['revision', ev.id, 'corregido']);
+  assert.equal(rep.codigo, 0);
+  assert.match(rep.salida, /ya tenía una revisión previa \(aprobado\); esta nueva revisión la reemplaza/);
+
+  assert.equal(orq(ctx, ['scorecard', '--desde', '2026-13-01']).codigo, 2);
+  const otroRepo = orq(ctx, ['scorecard', '--repo', 'inexistente']);
+  assert.equal(otroRepo.codigo, 0);
+  assert.match(otroRepo.salida, /Repos con delegaciones registradas: repo/);
+
+  assert.match(orq(ctx, ['scorecard']).salida, /min delegados/);
+  const det = orq(ctx, ['scorecard', '--detalle']);
+  assert.match(det.salida, /1er intento/);
+  assert.match(det.salida, /Críticas/);
 });

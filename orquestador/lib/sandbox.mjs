@@ -18,9 +18,13 @@ export const DIR_SHIMS_MACOS = path.join(RAIZ_ORQ, 'lib', 'shims-macos');
 
 /** Rutas con escritura además del worktree, los temporales y el estado del ejecutor. */
 export const ESCRITURA_BASE = [
-  '~/.npm', '~/.pnpm-store', '~/Library/pnpm/store', '~/.yarn/berry/cache', '~/.bun/install/cache',
+  '~/.npm', '~/.pnpm-store', '~/Library/pnpm/store', '~/.local/share/pnpm/store',
+  '~/.yarn/berry/cache', '~/.bun/install/cache',
   '~/.cache', '~/Library/Caches', '~/Library/Developer/Xcode/DerivedData',
-  '~/.cargo/registry', '~/.cargo/git', '~/go/pkg/mod', '~/.gradle/caches', '~/.m2/repository',
+  '~/Library/Developer/CoreSimulator', '~/Library/Logs/CoreSimulator',
+  '~/.cargo/registry', '~/.cargo/git', '~/.cargo/.package-cache',
+  '~/go/pkg/mod', '~/.gradle/caches', '~/.gradle/daemon', '~/.gradle/wrapper',
+  '~/.m2/repository', '~/.swiftpm',
 ];
 
 /** Credenciales que nunca se pueden leer desde el sandbox. */
@@ -61,6 +65,7 @@ export function configSandbox(registro) {
     escritura_extra: sb.escritura_extra ?? [],
     lectura_denegada: sb.lectura_denegada ?? [],
     lectura_extra: sb.lectura_extra ?? [],
+    preparar_con_credenciales: sb.preparar_con_credenciales === true,
   };
 }
 
@@ -119,15 +124,19 @@ const unicas = (lista) => [...new Set(lista)];
  * - sockets: agentes de SSH y GPG, a los que no se puede conectar (con ellos se firmaría o se haría push).
  */
 export function politicaSandbox(registro, {
-  escribibles = [], protegidas = [], legibles = [], credencialesExtra = [], tmp = null, plataforma = process.platform,
+  escribibles = [], protegidas = [], legibles = [], credencialesExtra = [], tmp = null, confiable = false, plataforma = process.platform,
 } = {}) {
   const cfg = configSandbox(registro);
   const darwin = darwinDirs(plataforma);
   const temporalesSistema = ['/tmp', '/var/tmp', darwin.tmp, darwin.cache].filter(Boolean).map(rutaReal);
   const temporalPropio = tmp ?? os.tmpdir();
   const tmpSistema = rutaReal(os.tmpdir());
-  const noEscribible = [
+  const legiblesEfectivos = [
     ...legibles,
+    ...(plataforma === 'darwin' && fs.existsSync(DIR_SHIMS_MACOS) ? [DIR_SHIMS_MACOS] : []),
+  ];
+  const noEscribible = [
+    ...legiblesEfectivos,
     ...cfg.lectura_denegada,
     ...cfg.lectura_extra,
     DIR_DATOS,
@@ -137,7 +146,8 @@ export function politicaSandbox(registro, {
     // Si $TMPDIR es distinto a DARWIN_USER_TEMP_DIR (p. ej. un entorno aislado), se mantiene cerrado salvo `tmp`.
     ...(tmp && tmpSistema !== darwin.tmp ? [tmpSistema] : []),
   ];
-  const sockets = [process.env.SSH_AUTH_SOCK, '~/.gnupg'].filter(Boolean);
+  const omitirCredenciales = confiable && cfg.preparar_con_credenciales === true;
+  const sockets = omitirCredenciales ? [] : [process.env.SSH_AUTH_SOCK, '~/.gnupg'].filter(Boolean);
   const propiasEscribibles = unicas([...escribibles, ...(tmp ? [tmp] : [])].map(rutaReal));
   return {
     temporalesSistema: unicas(temporalesSistema),
@@ -147,15 +157,20 @@ export function politicaSandbox(registro, {
     protegida: unicas(protegidas.map(rutaReal)),
     lecturaDenegada: unicas(cfg.lectura_denegada.map(rutaReal)),
     lecturaExtra: unicas(cfg.lectura_extra.map(rutaReal)),
-    legibles: unicas(legibles.map(rutaReal)),
+    legibles: unicas(legiblesEfectivos.map(rutaReal)),
     // Las rutas de la tarea (repo, worktree, estado del ejecutor, temporal propio) se reabren aunque caigan
     // dentro de /tmp/claude-* (p. ej. un proyecto de prueba en el scratchpad de Claude Code).
     propias: {
       escribibles: propiasEscribibles,
-      legibles: unicas([...propiasEscribibles, ...legibles.map(rutaReal)]),
+      legibles: unicas([...propiasEscribibles, ...legiblesEfectivos.map(rutaReal)]),
     },
-    credenciales: unicas([...LECTURA_DENEGADA_BASE, path.join(dirConfigClaude(), '.credentials.json'), ...credencialesExtra].map(rutaReal)),
+    credenciales: unicas([
+      ...(omitirCredenciales ? [] : LECTURA_DENEGADA_BASE),
+      path.join(dirConfigClaude(), '.credentials.json'),
+      ...credencialesExtra,
+    ].map(rutaReal)),
     sockets: unicas(sockets.map(rutaReal)),
+    bloquearAgenteSsh: !omitirCredenciales,
   };
 }
 
@@ -202,7 +217,7 @@ export function perfilMacos(pol) {
     ...regla('deny', 'file-write*', pol.protegida),
     ...regla('deny', 'file-read-data', pol.credenciales),
     ...regla('deny', 'file-read* file-write*', pol.credenciales),
-    `(deny network-outbound (remote unix-socket (path-regex #"${AGENTE_SSH_LAUNCHD}")))`,
+    ...(pol.bloquearAgenteSsh !== false ? [`(deny network-outbound (remote unix-socket (path-regex #"${AGENTE_SSH_LAUNCHD}")))`] : []),
     ...(pol.sockets ?? []).map((p) => `(deny network-outbound (remote unix-socket (subpath ${cadenaSbpl(p)})))`),
     '',
   ].join('\n');
@@ -290,7 +305,7 @@ export function sandboxActivo(registro, disponible) {
 }
 
 export function envolverEnSandbox(registro, {
-  bin, args, cwd, escribibles = [], protegidas = [], legibles = [], credencialesExtra = [], tmp = null, disponible,
+  bin, args, cwd, escribibles = [], protegidas = [], legibles = [], credencialesExtra = [], tmp = null, confiable = false, disponible,
 } = {}) {
   const { modo } = configSandbox(registro);
   if (modo === 'desactivado') return { bin, args, sandbox: null, aviso: null };
@@ -301,7 +316,24 @@ export function envolverEnSandbox(registro, {
     }
     return { bin, args, sandbox: null, aviso: `Sin sandbox (${d.motivo}): el modelo delegado corre con todos tus permisos.` };
   }
-  const pol = politicaSandbox(registro, { escribibles, protegidas, legibles, credencialesExtra, tmp });
+  if (d.tipo === 'bwrap') {
+    const homeReal = rutaReal(os.homedir());
+    const dentroDeHome = (p) => p.startsWith(`${homeReal}${path.sep}`);
+    for (const p of escribibles.map(rutaReal)) {
+      if (!fs.existsSync(p) && dentroDeHome(p)) {
+        try { fs.mkdirSync(p, { recursive: true }); } catch { /* ignorar */ }
+      }
+    }
+    for (const p of ESCRITURA_BASE.map(rutaReal)) {
+      if (!fs.existsSync(p) && dentroDeHome(p) && fs.existsSync(path.dirname(p))) {
+        try {
+          if (path.basename(p) === '.package-cache') fs.writeFileSync(p, '', { flag: 'wx' });
+          else fs.mkdirSync(p, { recursive: true });
+        } catch { /* ignorar */ }
+      }
+    }
+  }
+  const pol = politicaSandbox(registro, { escribibles, protegidas, legibles, credencialesExtra, tmp, confiable });
   if (d.tipo === 'sandbox-exec') return { bin: 'sandbox-exec', args: ['-p', perfilMacos(pol), bin, ...args], sandbox: d.tipo, aviso: null };
   return { bin: 'bwrap', args: [...argsBwrap(pol, cwd), '--', bin, ...args], sandbox: d.tipo, aviso: null };
 }

@@ -8,4 +8,4 @@ tools: Read, Grep, Glob
 
 Explora el repositorio y responde con un resumen breve: rutas relevantes, funciones clave y dependencias.
 No propongas cambios ni escribas código. Si el repo es demasiado grande para cubrir lo pedido, dilo
-para que el orquestador use el rol `explorar` de Command Code.
+para que el orquestador use el rol `explorar` con los modelos delegados (`orq delegar`).

@@ -58,7 +58,7 @@ node instalar.mjs
 | Subagentes Explore, analista-sonnet, implementador-sonnet y documentador-haiku | `~/.claude/agents/` |
 | Permisos (se fusionan con los tuyos y se respalda el original) | `~/.claude/settings.json` |
 | Comando `orq` | `~/.local/bin/orq` |
-| PATH, si hace falta (zsh, bash o fish) | `~/.zshrc`, `~/.bash_profile` o `~/.config/fish/conf.d/` |
+| PATH, si hace falta (zsh, bash o fish) | `~/.zshrc`, `~/.bash_profile` (macOS) / `~/.bashrc` (Linux) o `~/.config/fish/conf.d/` |
 
 El instalador respeta `CLAUDE_CONFIG_DIR` y termina con un diagnóstico (`orq doctor`).
 
@@ -66,12 +66,12 @@ El instalador respeta `CLAUDE_CONFIG_DIR` y termina con un diagnóstico (`orq do
 
 Vuelve a ejecutar el comando de instalación (`curl -fsSL https://raw.githubusercontent.com/allopze/omg/main/instalar.sh | bash`, `npx -y github:allopze/omg#<tag>` o `node instalar.mjs` tras `git pull`). El código nuevo se arma aparte (con sus dependencias) y recién entonces reemplaza al anterior: si `npm ci` falla, la instalación anterior queda intacta. Lo tuyo se conserva:
 
-- **Registro (`models.yaml`):** si no lo modificaste desde que lo instaló el orquestador (o es la plantilla de la 0.2 sin tocar), se actualiza y el anterior queda en `models.yaml.anterior`. Si lo modificaste, se conserva y la versión del paquete queda en `models.yaml.nuevo` para que compares; las claves nuevas que no tengas toman su valor por defecto. Tus ajustes (`antigravity.permitir_cuenta_personal`, `sandbox.lectura_denegada`, `sandbox.lectura_extra`) y los resultados de la Fase 0 (`skills_compatibles`, `salida_json`) no cuentan como modificación y se conservan al actualizar.
+- **Registro (`models.yaml`):** si no lo modificaste desde que lo instaló el orquestador (o es la plantilla de la 0.2 sin tocar), se actualiza y el anterior queda en `models.yaml.anterior`. Si lo modificaste, se conserva y la versión del paquete queda en `models.yaml.nuevo` para que compares; las claves nuevas que no tengas toman su valor por defecto. Tus ajustes (`antigravity.permitir_cuenta_personal`, `sandbox.lectura_denegada`, `sandbox.lectura_extra`, `sandbox.escritura_extra`, `sandbox.preparar_con_credenciales`) y los resultados de la Fase 0 (`skills_compatibles`, `salida_json`) no cuentan como modificación y se conservan al actualizar.
 - **Subagentes:** si modificaste alguno, se conserva (con `--forzar` se reemplaza).
 - **Logs:** se conservan.
 - **Permisos:** las reglas que una versión anterior agregó y ya no se usan se quitan.
 
-Después de actualizar, corre la Fase 0 (`orq verificar --guardar`): comprueba que Command Code funciona dentro del sandbox y activa la medición de tokens.
+Después de actualizar, corre la Fase 0 (`orq verificar --guardar` o `--capacidades`): comprueba que Command Code funciona dentro del sandbox y fija la detección de `--skill` y `--output-format json` (en `cmd >= 1.0.0`, `salida_json` se activa automáticamente si está en `null`).
 
 ### Desinstalar
 
@@ -92,9 +92,11 @@ El registro y los logs se respaldan en `~/.claude/orquestador-respaldo-<fecha>/`
 ## Fase 0
 
 ```bash
-orq verificar --sin-llamadas   # versiones, catálogos, autenticación y sandbox local, sin gastar créditos
-orq verificar --guardar        # pruebas reales con prompts mínimos
-orq verificar --modelo antigravity/gemini-4-neon   # solo ese modelo (cada llamada a agy tarda ~40 s)
+orq verificar --sin-llamadas                      # versiones, catálogos, autenticación y sandbox local, sin gastar créditos
+orq verificar --capacidades --guardar             # solo sonda --skill y --output-format json en Command Code y los guarda
+orq verificar --guardar                           # pruebas reales completas con prompts mínimos
+orq verificar --modelo antigravity/gemini-4-neon  # solo ese modelo (cada llamada a agy tarda ~40 s)
+orq verificar --ejecutor command_code --guardar   # solo ese ejecutor
 ```
 
 La corrida con llamadas comprueba, por cada modelo de la whitelist:
@@ -102,10 +104,10 @@ La corrida con llamadas comprueba, por cada modelo de la whitelist:
 1. Como rol de solo lectura, lee el repo y no escribe.
 2. Acepta cada nivel de effort del registro (en Antigravity, cada slug de `agy models`).
 3. Command Code: `--skill` carga el formato `SKILL.md` de Claude Code.
-4. Command Code: `--output-format json` entrega la línea final con los tokens (agy siempre la entrega).
+4. Command Code: `--output-format json` entrega la línea final con los tokens (agy siempre la entrega; con `cmd >= 1.0.0`, `salida_json` se activa automáticamente si su valor es `null`).
 5. Funciona dentro del sandbox y el sandbox bloquea sus escrituras fuera del worktree.
 
-Con `--guardar`, los resultados de 3 y 4 quedan en el registro (`skills_compatibles` y `salida_json`): solo cambian esas dos líneas, el resto del archivo queda igual.
+Con `--guardar`, los resultados de 3 y 4 quedan en el registro (`skills_compatibles` y `salida_json`): solo cambian esas dos líneas, el resto del archivo queda igual. Con `--capacidades` puedes verificar únicamente esos dos flags en Command Code sin correr toda la matriz de modelos y efforts.
 
 ## Sandbox
 
@@ -120,17 +122,18 @@ Cada ejecución de un modelo delegado (Command Code o Antigravity), y cada coman
 - **Protegido:** el archivo `.git` del worktree (no puede apuntarlo a otro repo ni cambiar de rama).
 - **Sin lectura, nunca:** `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials` y las credenciales de Claude Code.
 - **Sin lectura, si lo pides (`lectura_denegada` y `lectura_extra`):** por ejemplo la carpeta donde guardas tus repos. El repo de la tarea, su worktree, el estado del ejecutor y cualquier ruta listada en `lectura_extra` (en modo solo lectura, p. ej. datos de referencia compartidos) se vuelven a abrir aunque estén dentro, y las credenciales siguen cerradas aunque estén dentro de algo legible. Se bloquea el contenido y el listado de carpetas; los metadatos siguen visibles, porque `git` y `realpath` los necesitan.
-- **Sin secretos:** el modelo delegado y `validar` reciben el entorno sin `SSH_AUTH_SOCK` ni variables con pinta de secreto (`GH_TOKEN`, `AWS_*`, `ANTHROPIC_API_KEY`, `NPM_TOKEN`…; se conservan las que su ejecutor necesita, como `GEMINI_API_KEY`), no pueden conectarse a tus agentes de SSH o GPG, no leen tokens de registros de paquetes (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`…) ni la autenticación del otro ejecutor. `preparar` (comandos tuyos) sí recibe el entorno completo.
+- **Sin secretos:** el modelo delegado y `validar` reciben el entorno sin `SSH_AUTH_SOCK` ni variables con pinta de secreto (`GH_TOKEN`, `AWS_*`, `ANTHROPIC_API_KEY`, `NPM_TOKEN`…; se conservan las que su ejecutor necesita, como `GEMINI_API_KEY`), no pueden conectarse a tus agentes de SSH o GPG, no leen tokens de registros de paquetes (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`…) ni la autenticación del otro ejecutor. `preparar` (comandos tuyos) sí recibe el entorno completo; por defecto tampoco accede a `~/.ssh`, `~/.aws`, `~/.config/gh` ni `SSH_AUTH_SOCK` dentro del sandbox, salvo que habilites `sandbox.preparar_con_credenciales: true` (útil si instalas dependencias privadas).
 - **Red:** abierta (el ejecutor la necesita para hablar con el modelo).
 
 Se configura en `sandbox` del registro global (en la 0.3 estaba en `command_code.sandbox`, que se sigue aceptando):
 
 ```yaml
 sandbox:
-  modo: auto              # auto | obligatorio | desactivado
-  escritura_extra: []     # carpetas adicionales donde el ejecutor necesita escribir
-  lectura_denegada: ["~/dev"]    # carpetas que no puede leer ([] desactiva la restricción)
-  lectura_extra: []              # carpetas de solo lectura dentro de lectura_denegada
+  modo: auto                        # auto | obligatorio | desactivado
+  escritura_extra: []               # carpetas adicionales donde el ejecutor necesita escribir
+  lectura_denegada: ["~/dev"]       # carpetas que no puede leer ([] desactiva la restricción)
+  lectura_extra: []                 # carpetas de solo lectura dentro de lectura_denegada
+  preparar_con_credenciales: false  # true: permite SSH y credenciales solo en preparar (deps privadas)
 ```
 
 **Por defecto, `lectura_denegada` es `["~/dev"]`:** si guardas tus repos en otra carpeta, cámbialo. Un agente no necesita leer otros proyectos (si una tarea depende de una carpeta vecina, por ejemplo datos de referencia o un paquete enlazado con `file:../otro`, agrégala a `lectura_extra` o vacía `lectura_denegada`), y en las pruebas, Antigravity sin esa restricción exploró carpetas ajenas y el código del orquestador antes de hacer una tarea de una línea (289 s y más de 100 mil tokens, frente a 53 s y 28 mil con la restricción).
@@ -271,14 +274,15 @@ En ese caso, agrega `dir_externo` a `permissions.additionalDirectories` de Claud
 
 | Comando | Para qué |
 | --- | --- |
-| `orq delegar <rol> [--continuar <tarea>] [--modelo ID] [--fase T] [--prompt-archivo R] [--dry-run]` | Delega al modelo del rol (lo usa Opus) |
+| `orq delegar <rol> [--continuar <tarea> \| --worktree <ruta>] [--modelo ID] [--fase T] [--prompt-archivo R] [--dry-run]` | Delega al modelo del rol (lo usa Opus) |
 | `orq revision <id del intento> aprobado\|ajustado\|corregido [--nota]` | Registra la revisión de ese intento |
 | `orq validar <tarea> [-- comando]` | Corre los `validar` del repo (o el comando) en el worktree, dentro del sandbox |
-| `orq estado` | Configuración efectiva del repo actual |
+| `orq ver <id\|tarea>` | Inspecciona el estado, prompt, log de salida y diff de una delegación o tarea |
+| `orq estado [--resumen] [--json]` | Configuración efectiva del repo actual |
 | `orq init [--sensible] [--forzar]` | Crea los ajustes del repo |
-| `orq limpiar [--descartar <id>] [--simular]` | Elimina worktrees integrados, o uno sin integrar |
-| `orq scorecard [--desde F] [--aqui \| --repo N] [--json]` | Métricas por delegación y por tarea, con sugerencias |
-| `orq verificar [--sin-llamadas] [--guardar] [--modelo ID]` | Fase 0 |
+| `orq limpiar [--descartar <id\|ruta\|rama>] [--resueltas] [--logs] [--simular]` | Elimina worktrees integrados (o resueltos), poda logs antiguos o descarta uno sin integrar |
+| `orq scorecard [--desde AAAA-MM-DD] [--aqui \| --repo N] [--detalle] [--json]` | Métricas por delegación y por tarea, con sugerencias |
+| `orq verificar [--sin-llamadas] [--capacidades] [--guardar] [--modelo ID] [--ejecutor N]` | Fase 0 |
 | `orq doctor` | Diagnóstico de la instalación y del repo |
 
 Claude Code puede usar sin pedir permiso `delegar`, `revision`, `validar`, `estado`, `scorecard` y `doctor`. Para `limpiar`, `init` y `verificar` te pide confirmación.
@@ -288,23 +292,24 @@ Claude Code puede usar sin pedir permiso `delegar`, `revision`, `validar`, `esta
 | Código | Significa |
 | --- | --- |
 | 0 | Terminó (revisa el resumen) |
-| 1 | Falló: el modelo delegado terminó con error o sin respuesta, o `orq` falló a mitad de camino. El código propio del ejecutor (por ejemplo, 5 = rate limit en Command Code) queda en el resumen y en el log, nunca como código de `orq` |
+| 1 | Falló: `preparar` falló, el modelo delegado terminó con error o sin respuesta, o `orq` falló a mitad de camino. El código propio del ejecutor (por ejemplo, 5 = rate limit en Command Code) queda en el resumen y en el log, nunca como código de `orq` |
 | 2 | Uso o configuración: rol o tarea desconocidos, prompt vacío, registro inválido, ejecutor no instalado |
 | 3 | Bloqueado: fuera de whitelist, modelo retirado, repo sensible, orquestador desactivado o sandbox obligatorio no disponible |
 | 4 | Escalar: se agotaron los intentos con los modelos delegados |
 | 5 | Integridad: el modelo delegado tocó algo fuera de su worktree. Opus se detiene y te avisa |
 | 124 | Timeout: se terminó el ejecutor junto con los procesos que lanzó |
+| 130 / 143 | Interrumpido por señal (`SIGINT` / `SIGTERM`): el intento queda registrado y puedes retomarlo con `--continuar <tarea>` (recupera `<tarea>` con `orq estado`) |
 
 ## Scorecard
 
 `orq scorecard` agrega los logs de todos tus repos:
 
-- **Por delegación** (modelo, rol, effort, skills): aprobación, aprobación al primer intento, ajustes manuales de Opus, tasa de `validar` OK, alertas, críticas, minutos y tokens promedio.
+- **Por delegación** (modelo, rol, effort, skills): aprobación, aprobación al primer intento, ajustes manuales de Opus, tasa de `validar` OK, alertas, críticas, minutos y tokens promedio (`--detalle` muestra todas las columnas).
 - **Por tarea** (por rol): cuántas se resuelven al primer intento, cuántas con reintento, cuántas escalan, intentos, minutos y tokens por tarea.
-- **Totales:** minutos de Command Code, tokens, costo (si Command Code lo informa) y ajustes de Opus.
+- **Totales:** minutos delegados, tokens, costo (si el ejecutor lo informa) y ajustes de Opus.
 - **Sugerencias:** promover, degradar o sumar un segundo modelo según los umbrales del registro.
 
-Los tokens se registran solo con `salida_json: true` (lo activa la Fase 0). El costo del lado de Opus (planificar y revisar) no lo ve `orq`. Compáralo con el uso de Claude Code para saber si delegar compensa.
+Los tokens se registran con `salida_json: true` (en `cmd >= 1.0.0` se activa automáticamente si `salida_json` es `null`; también lo fija `orq verificar --guardar`) o usando Antigravity. El costo del lado de Opus (planificar y revisar) no lo ve `orq`. Compáralo con el uso de Claude Code para saber si delegar compensa.
 
 ## Desde versiones anteriores
 
@@ -325,7 +330,7 @@ Los logs de la 0.1 no se migran.
 ## Tests
 
 ```bash
-npm test   # instala dependencias, 97 tests del CLI (con cmd y agy falsos, sin gastar créditos) y 8 escenarios del instalador en un HOME aislado
+npm test   # instala dependencias, 100+ tests del CLI (con cmd y agy falsos, sin gastar créditos) y 8 escenarios del instalador en un HOME aislado
 ```
 
 O por separado: `cd orquestador && npm test` y `node --test pruebas/*.test.mjs`. Las pruebas del sandbox real corren solo en macOS. En Linux, las de `bwrap` cubren los argumentos que se construyen, no una ejecución real.

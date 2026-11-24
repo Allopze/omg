@@ -16,7 +16,12 @@
 //   repo-anidado       crea un repo git con un commit dentro del worktree
 //   entorno            anota en docs/entorno.json algunas variables de entorno que recibió
 //   sale-con           escribe y termina con el código CMD_FALSO_CODIGO (5 por defecto)
+//   ndjson-truncado    emite eventos JSON (y opcionalmente CMD_FALSO_AVISO) y sale con 0 sin evento result
+//   max-turns          emite un evento result con subtype: 'max_turns' y sale con 0
+//   sin-texto          emite un evento result con finalText vacío y sale con 0
+//   escribe-y-valida-A crea docs/cambio-<n>.md y deja además un archivo nuevo staged (`A `) si CMD_FALSO_STAGED está definido
 // CMD_FALSO_ESCRIBIR="a/b.txt,c.txt" crea además esas rutas relativas.
+// CMD_FALSO_ESPERAR="/tmp/.../seguir" espera hasta que exista ese archivo (máx. 15 s) antes de terminar.
 // Con --output-format json emite NDJSON con eventos y una línea final con usage.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -54,10 +59,35 @@ const escribirPedidos = () => {
 
 if (modo === 'falla') { console.error('error simulado'); process.exit(1); }
 if (modo === 'solo-escribir') { escribirPedidos(); terminar('OK'); }
+if (modo === 'ndjson-truncado') {
+  evento(yolo ? 'write_file' : 'read_file');
+  if (process.env.CMD_FALSO_AVISO) console.log(process.env.CMD_FALSO_AVISO);
+  process.exit(0);
+}
+if (modo === 'max-turns') {
+  evento(yolo ? 'write_file' : 'read_file');
+  if (json) {
+    console.log(JSON.stringify({
+      type: 'result', subtype: 'max_turns', sessionId: 's', stopReason: 'max_turns',
+      usage: { inputTokens: 800, outputTokens: 150 }, durationMs: 10, finalText: 'Límite de turnos alcanzado',
+    }));
+  } else console.log('Límite de turnos alcanzado');
+  process.exit(0);
+}
+if (modo === 'sin-texto') {
+  evento(yolo ? 'write_file' : 'read_file');
+  terminar('');
+}
 if (modo === 'cuelga') {
   spawn('sleep', ['37.123'], { stdio: 'inherit' });
   setInterval(() => {}, 1000);
 } else {
+  if (process.env.CMD_FALSO_ESPERAR) {
+    const limite = Date.now() + 15000;
+    while (!fs.existsSync(process.env.CMD_FALSO_ESPERAR) && Date.now() < limite) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
+  }
   // Prueba de lectura de verificar.mjs
   if (entrada.includes('secreto.txt') && fs.existsSync('secreto.txt')) {
     console.log(fs.readFileSync('secreto.txt', 'utf8').trim());
@@ -118,6 +148,12 @@ if (modo === 'cuelga') {
     if (modo === 'commitea') {
       execFileSync('git', ['add', '-A'], { stdio: 'ignore' });
       execFileSync('git', ['-c', 'user.name=x', '-c', 'user.email=x@x', 'commit', '-q', '-m', 'propio'], { stdio: 'ignore' });
+    }
+    if (modo === 'escribe-y-valida-A') {
+      const staged = process.env.CMD_FALSO_STAGED || 'nuevo-staged.txt';
+      fs.mkdirSync(path.dirname(staged), { recursive: true });
+      fs.writeFileSync(staged, 'staged\n');
+      intentar(() => execFileSync('git', ['add', staged], { stdio: 'ignore' }));
     }
     if (modo === 'deja-proceso') spawn('sleep', ['38.321'], { stdio: 'inherit' }).unref();
     if (modo === 'sale-con') {

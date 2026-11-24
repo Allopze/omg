@@ -2,6 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { VERSION_MINIMA_CMD } from '../constantes.mjs';
+import { expandirHome } from '../config.mjs';
 import { crearLectorJson } from '../salida-cmd.mjs';
 
 export const commandCode = {
@@ -10,21 +11,23 @@ export const commandCode = {
   versionMinima: VERSION_MINIMA_CMD,
   instalar: 'npm i -g command-code@latest',
 
-  bin: (registro) => process.env.ORQ_CMD_BIN || registro?.command_code?.bin || 'cmd',
+  bin: (registro) => expandirHome(process.env.ORQ_CMD_BIN || registro?.command_code?.bin || 'cmd'),
   config: (registro) => registro?.command_code ?? {},
 
   /** Argumentos de `cmd` para una delegación resuelta. Las skills deben venir como rutas absolutas. */
-  args(res, skillsAbsolutas = []) {
-    const args = ['-p', '--model', res.modelo, '--effort', res.effort];
+  args(res, skillsAbsolutas = [], opciones = {}) {
+    const args = ['-p', '--model', res.modelo, '--effort', res.effort_cli ?? res.effort];
     if (res.yolo) args.push('--yolo');
+    else if (opciones?.plan) args.push('--plan');
     for (const s of skillsAbsolutas) args.push('--skill', s);
     if (res.salida_json) args.push('--output-format', 'json');
+    if (opciones?.sinSesion) args.push('--no-session', '--no-auto-update');
     args.push('--skip-onboarding');
     return args;
   },
 
   entrada: (prompt) => prompt,
-  lector: (res) => (res.salida_json ? crearLectorJson() : null),
+  lector: (res, opts) => (res.salida_json ? crearLectorJson(opts) : null),
 
   /** Carpetas de estado que necesita escribir dentro del sandbox, y la configuración que no puede tocar. */
   /**
@@ -47,10 +50,14 @@ export const commandCode = {
 
   acceso: () => ({ modo: 'cuenta', etiquetaModo: 'tu cuenta de Command Code', bloqueo: null }),
 
-  /** Catálogo de modelos (texto), o null si falla. */
+  /** Catálogo de modelos: { ok, salida, error }. */
   catalogo(bin) {
     const r = spawnSync(bin, ['--list-models'], { encoding: 'utf8', timeout: 60000 });
-    return r.status === 0 ? `${r.stdout ?? ''}${r.stderr ?? ''}` : null;
+    return {
+      ok: r.status === 0 && !r.error,
+      salida: `${r.stdout ?? ''}${r.stderr ?? ''}`,
+      error: r.error?.message || (r.status !== 0 ? (r.stderr?.trim() || `código ${r.status}`) : null),
+    };
   },
 
   /** Ids que deben aparecer en el catálogo para un modelo del registro. */

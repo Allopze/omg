@@ -16,19 +16,29 @@ export function tareaDe(e) {
 
 const esAprobado = (r) => r === 'aprobado' || r === 'ajustado';
 
+const esObjeto = (e) => e !== null && typeof e === 'object' && !Array.isArray(e);
+const esDelegacion = (e) => esObjeto(e) && e.tipo === 'delegacion' && typeof e.fecha === 'string';
+
 export function mapaRevisiones(eventos) {
   const revision = new Map();
-  for (const e of eventos) if (e.tipo === 'revision') revision.set(e.id, e.resultado);
+  if (!Array.isArray(eventos)) return revision;
+  for (const e of eventos) {
+    if (esObjeto(e) && e.tipo === 'revision' && typeof e.id === 'string') revision.set(e.id, e.resultado);
+  }
   return revision;
 }
 
 /** Busca una tarea del repo por id de tarea, id de delegación o ruta de su worktree. */
 export function buscarTarea(eventos, raiz, valor) {
-  const delegaciones = eventos.filter((e) => e.tipo === 'delegacion' && e.raiz === raiz);
+  if (!Array.isArray(eventos) || typeof valor !== 'string' || !valor) return null;
+  const delegaciones = eventos.filter((e) => esDelegacion(e) && e.raiz === raiz);
   let d = delegaciones.find((e) => e.id === valor || tareaDe(e) === valor);
   if (!d) {
-    const abs = path.resolve(raiz, valor);
-    d = delegaciones.find((e) => e.worktree && path.resolve(raiz, e.worktree) === abs);
+    const porBase = (base) => {
+      const abs = path.resolve(base, valor);
+      return delegaciones.find((e) => e.worktree && path.resolve(raiz, e.worktree) === abs);
+    };
+    d = porBase(process.cwd()) ?? porBase(raiz);
   }
   if (!d) return null;
   const tarea = tareaDe(d);
@@ -41,9 +51,11 @@ export function buscarTarea(eventos, raiz, valor) {
  * si se escaló y cuánto costó en tiempo y tokens de Command Code.
  */
 export function resumirTareas(eventos) {
+  if (!Array.isArray(eventos)) return [];
   const revision = mapaRevisiones(eventos);
+  const delegaciones = eventos.filter(esDelegacion).sort((a, b) => a.fecha.localeCompare(b.fecha));
   const tareas = new Map();
-  for (const d of eventos.filter((e) => e.tipo === 'delegacion').sort((a, b) => a.fecha.localeCompare(b.fecha))) {
+  for (const d of delegaciones) {
     const id = tareaDe(d);
     if (!tareas.has(id)) {
       tareas.set(id, {
@@ -55,25 +67,29 @@ export function resumirTareas(eventos) {
     const t = tareas.get(id);
     t.intentos++;
     t.ultima = d;
-    t.ultima_revision = revision.get(d.id) ?? null;
+    const rev = revision.get(d.id) ?? null;
+    t.ultima_revision = rev;
     t.duracion_ms += d.duracion_ms ?? 0;
     const tokens = tokensTotales(d.uso);
     if (tokens !== null) {
       t.tokens += tokens;
       t.con_tokens = true;
     }
-    if (t.resuelta_en === null && esAprobado(revision.get(d.id))) t.resuelta_en = d.intento ?? t.intentos;
+    t.resuelta_en = esAprobado(rev) ? (d.intento ?? t.intentos) : null;
   }
-  const delegaciones = eventos.filter((e) => e.tipo === 'delegacion').sort((a, b) => a.fecha.localeCompare(b.fecha));
-  for (const e of eventos.filter((x) => x.tipo === 'escalamiento')) {
-    // Los escalamientos de la 0.2 no tienen `tarea`: se asignan a la última delegación del mismo rol y repo.
-    const id = e.tarea ?? delegaciones.filter((d) => d.rol === e.rol && d.raiz === e.raiz && d.fecha <= e.fecha).map(tareaDe).at(-1);
-    const t = tareas.get(id);
-    if (t) t.escalada = true;
-  }
-  for (const e of eventos.filter((x) => x.tipo === 'descarte')) {
-    const t = tareas.get(e.tarea);
-    if (t) t.descartada = true;
+  for (const e of eventos) {
+    if (!esObjeto(e)) continue;
+    if (e.tipo === 'escalamiento') {
+      // Los escalamientos de la 0.2 no tienen `tarea`: se asignan a la última delegación del mismo rol y repo.
+      const id = e.tarea ?? (typeof e.fecha === 'string'
+        ? delegaciones.filter((d) => d.rol === e.rol && d.raiz === e.raiz && d.fecha <= e.fecha).map(tareaDe).at(-1)
+        : undefined);
+      const t = tareas.get(id);
+      if (t) t.escalada = true;
+    } else if (e.tipo === 'descarte') {
+      const t = tareas.get(e.tarea);
+      if (t) t.descartada = true;
+    }
   }
   for (const t of tareas.values()) {
     if (t.resuelta_en !== null) t.estado = 'resuelta';

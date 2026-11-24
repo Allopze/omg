@@ -32,7 +32,7 @@ command_code:
   #   false/null -> salida de texto, sin datos de tokens
   salida_json: null
 
-# Ejecutor Antigravity CLI (`agy -p`, headless). Siempre entrega JSON con tokens; no recibe skills por flag.
+# Ejecutor Antigravity CLI (`agy --input-format stream-json --output-format stream-json`, headless). Siempre entrega JSON con tokens; no recibe skills por flag.
 # Cada llamada tarda unos 40 s en arrancar y carga ~25 mil tokens de contexto propio de agy.
 # Autenticación (orq la detecta sola):
 #   API key de AI Studio -> "modelProvider": "gemini" en ~/.gemini/antigravity-cli/settings.json + GEMINI_API_KEY
@@ -40,8 +40,9 @@ command_code:
 #   Cuenta personal (el login de agy) -> el FAQ de Antigravity dice que envolver agy en otras aplicaciones
 #     "is not supported under consumer plans", y los términos prevén suspender las cuentas de Antigravity y
 #     Gemini CLI. Con false, orq bloquea los modelos de Antigravity cuando agy usa la cuenta personal.
-# permitir_cuenta_personal, sandbox.lectura_denegada y sandbox.lectura_extra son ajustes tuyos: el instalador
-# conserva su valor al actualizar este archivo y cambiarlos no cuenta como modificarlo.
+# permitir_cuenta_personal, sandbox.escritura_extra, sandbox.lectura_denegada, sandbox.lectura_extra y
+# sandbox.preparar_con_credenciales son ajustes tuyos: el instalador conserva su valor al actualizar este
+# archivo y cambiarlos no cuenta como modificarlo.
 antigravity:
   bin: agy
   timeout_min: 30
@@ -64,6 +65,7 @@ sandbox:
   lectura_denegada: ["~/dev"]    # ej. ["~/dev", "~/Documents"]
   # Carpetas de solo lectura que se reabren dentro de lectura_denegada (p. ej. datos de referencia compartidos).
   lectura_extra: []              # ej. ["~/dev/datos/referencias"]
+  preparar_con_credenciales: false   # true: permite SSH y credenciales solo en preparar (dependencias privadas)
 
 # Dónde se crean los worktrees de las delegaciones de escritura.
 #   repo    -> <repo>/.claude/worktrees/<id>, excluido en .git/info/exclude. Es lo más simple, pero

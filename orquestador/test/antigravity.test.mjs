@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  MAC, entorno, orq, eventos, delegaciones, llamadasAgy, git, ajustesRepo, permitirCuentaPersonal, bloquearCuentaPersonal,
+  DIR, MAC, entorno, orq, eventos, delegaciones, llamadasAgy, git, ajustesRepo, permitirCuentaPersonal, bloquearCuentaPersonal,
 } from './ayuda.mjs';
 
 const NEON = 'antigravity/gemini-4-neon';
@@ -168,4 +168,75 @@ test('Antigravity: verificar y doctor', () => {
   if (MAC) assert.match(v.salida, /✔ antigravity\/gemini-4-neon: el sandbox bloquea sus escrituras fuera del worktree/);
   assert.doesNotMatch(v.salida, /Command Code/, '--modelo limita la verificación a ese modelo');
   assert.match(orq(ctx, ['doctor']).salida, /✔ Antigravity: tu cuenta personal de Google \(permitida en el registro\)/);
+});
+
+const prepararClaudeParaDoctor = (ctx) => {
+  const dirAgentes = path.join(ctx.claude, 'agents');
+  fs.mkdirSync(dirAgentes, { recursive: true });
+  for (const a of ['Explore', 'analista-sonnet', 'implementador-sonnet', 'documentador-haiku']) {
+    fs.writeFileSync(path.join(dirAgentes, `${a}.md`), `# ${a}\n`);
+  }
+  const permisos = fs.readFileSync(path.join(DIR, '..', 'permisos.json'), 'utf8').replaceAll('{{ORQ_DIR}}', ctx.datos);
+  fs.writeFileSync(path.join(ctx.claude, 'settings.json'), JSON.stringify({ permissions: JSON.parse(permisos) }));
+};
+
+test('Antigravity opcional sin agy instalado: doctor y verificar --sin-llamadas salen con 0 y aviso !', () => {
+  const ctx = entorno();
+  prepararClaudeParaDoctor(ctx);
+  const env = { ORQ_AGY_BIN: '/no/existe' };
+
+  const doc = orq(ctx, ['doctor'], { env });
+  assert.equal(doc.codigo, 0, doc.salida + doc.error);
+  assert.match(doc.salida, /! Antigravity \(opcional\) no encontrado \(\/no\/existe\)/);
+
+  const ver = orq(ctx, ['verificar', '--sin-llamadas'], { env });
+  assert.equal(ver.codigo, 0, ver.salida + ver.error);
+  assert.match(ver.salida, /! Antigravity \(opcional\) no encontrado \(\/no\/existe\)/);
+
+  const verExp = orq(ctx, ['verificar', '--sin-llamadas', '--ejecutor', 'antigravity'], { env });
+  assert.equal(verExp.codigo, 1);
+  assert.match(verExp.salida, /✘ Antigravity instalado \(\/no\/existe\)/);
+
+  const est = orq(ctx, ['estado'], { env });
+  assert.equal(est.codigo, 0, est.error);
+  assert.match(est.salida, /Antigravity \(opcional\): no instalado — 2 modelo\(s\) omitidos/);
+  assert.match(est.salida, /\(Antigravity opcional no instalado: 2 modelo\(s\) omitidos/);
+
+  // Si un rol usa Antigravity como primario, deja de ser opcional
+  const requerido = entorno({
+    editarRegistro: (y) => y.replace('primario: deepseek/deepseek-v4.1-flash-fast', 'primario: antigravity/gemini-4-neon'),
+  });
+  prepararClaudeParaDoctor(requerido);
+  const docReq = orq(requerido, ['doctor'], { env });
+  assert.equal(docReq.codigo, 1);
+  assert.match(docReq.salida, /✘ Antigravity no encontrado \(\/no\/existe\)/);
+  assert.equal(orq(requerido, ['verificar', '--sin-llamadas'], { env }).codigo, 1);
+});
+
+test('Antigravity: --continuar sin <rol> ni --modelo hereda rol y modelo; stream truncado y evento error fallan', () => {
+  const ctx = entorno({ editarRegistro: permitirCuentaPersonal });
+  const r1 = orq(ctx, ['delegar', 'implementar', '--modelo', NEON], { entrada: 'x' });
+  assert.equal(r1.codigo, 0, r1.error);
+  const [ev1] = delegaciones(ctx);
+  orq(ctx, ['revision', ev1.id, 'corregido']);
+
+  const r2 = orq(ctx, ['delegar', '--continuar', ev1.tarea], { entrada: 'y' });
+  assert.equal(r2.codigo, 0, r2.error + r2.salida);
+  const ev2 = delegaciones(ctx)[1];
+  assert.equal(ev2.rol, 'implementar');
+  assert.equal(ev2.modelo, NEON);
+  assert.equal(ev2.ejecutor, 'antigravity');
+  assert.equal(ev2.slug, 'gemini-4-neon-xhigh');
+  assert.equal(ev2.intento, 2);
+
+  const trunc = orq(ctx, ['delegar', 'implementar', '--modelo', NEON], { entrada: 'z', modoAgy: 'ndjson-truncado' });
+  assert.equal(trunc.codigo, 1);
+  assert.match(delegaciones(ctx).at(-1).alertas.join(' '), /Antigravity terminó sin evento final JSON/);
+
+  const evErr = orq(ctx, ['delegar', 'implementar', '--modelo', NEON], { entrada: 'w', modoAgy: 'error-evento' });
+  assert.equal(evErr.codigo, 1);
+  assert.match(delegaciones(ctx).at(-1).alertas.join(' '), /Antigravity reportó un error: fallo en stream/);
+
+  const sinSb = entorno({ editarRegistro: permitirCuentaPersonal, sandbox: 'desactivado' });
+  assert.match(orq(sinSb, ['estado']).salida, /Aviso: Antigravity sin sandbox en roles de solo lectura/);
 });

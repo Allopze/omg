@@ -40,9 +40,9 @@ async function terminarGrupo(pid, graciaMs = GRACIA_MS) {
  * - Por timeout, termina el grupo completo (el agente y todo lo que lanzó).
  * - Cuando el proceso principal sale, también termina el grupo: un servidor o watcher que haya
  *   quedado corriendo no deja colgado al orquestador manteniendo abierto el stdout.
- * - Si orq recibe SIGINT/SIGTERM/SIGHUP mientras espera, termina el grupo antes de salir.
+ * - Si orq recibe SIGINT/SIGTERM/SIGHUP mientras espera, termina el grupo antes de resolver.
  *
- * Devuelve { codigo, duracion_ms, timeout, error }.
+ * Devuelve { codigo, duracion_ms, timeout, interrumpida, senal, error? }.
  */
 export function ejecutarProceso(bin, args, {
   cwd, entrada = '', env = process.env, rutaSalida = null, timeoutMs, alStdout, alStderr, alInterrumpir: avisar,
@@ -54,50 +54,76 @@ export function ejecutarProceso(bin, args, {
     let porTimeout = false;
     let resuelto = false;
     let temporizador = null;
+    let espera = null;
+    let interrumpida = null;
 
     const hijo = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
 
-    // `avisar` (síncrono) deja constancia antes de salir: sin él, la delegación quedaría sin registro.
-    const alInterrumpir = (senal) => {
-      if (hijo.pid) senalGrupo(hijo.pid, 'SIGKILL');
-      try {
-        avisar?.(senal);
-      } catch { /* salir igual */ }
-      process.exit(senal === 'SIGINT' ? 130 : 143);
-    };
     const SENALES = ['SIGINT', 'SIGTERM', 'SIGHUP'];
-    for (const s of SENALES) process.on(s, alInterrumpir);
-
-    const terminar = async (resultado) => {
+    const terminar = async (resultado, graciaMs = 2000) => {
       if (resuelto) return;
       resuelto = true;
       clearTimeout(temporizador);
+      clearTimeout(espera);
       for (const s of SENALES) process.off(s, alInterrumpir);
-      if (hijo.pid) await terminarGrupo(hijo.pid, 2000);
+      if (hijo.pid) await terminarGrupo(hijo.pid, graciaMs);
       hijo.stdout?.destroy();
       hijo.stderr?.destroy();
-      const fin = () => resolve({ ...resultado, duracion_ms: Date.now() - inicio });
+      const fin = () => resolve({
+        ...resultado,
+        interrumpida: resultado.interrumpida ?? interrumpida ?? null,
+        senal: resultado.senal ?? null,
+        duracion_ms: Date.now() - inicio,
+      });
       if (archivo) archivo.end(fin);
       else fin();
     };
 
-    if (timeoutMs) {
+    // `avisar` (síncrono) deja constancia antes de terminar el grupo y resolver limpiamente.
+    const alInterrumpir = (senal) => {
+      if (resuelto) return;
+      interrumpida = senal;
+      try {
+        avisar?.(senal);
+      } catch { /* continuar con el cierre */ }
+      terminar({
+        codigo: senal === 'SIGINT' ? 130 : 143,
+        timeout: false,
+        interrumpida: senal,
+        senal,
+      }, 1500);
+    };
+    for (const s of SENALES) process.on(s, alInterrumpir);
+
+    if (timeoutMs > 0) {
       temporizador = setTimeout(() => {
         porTimeout = true;
         if (hijo.pid) terminarGrupo(hijo.pid);
-      }, timeoutMs);
+      }, Math.min(timeoutMs, 2_147_483_647));
     }
 
     hijo.stdout.on('data', (d) => { archivo?.write(d); alStdout?.(d); });
     hijo.stderr.on('data', (d) => { archivo?.write(d); alStderr?.(d); });
 
     hijo.on('error', (e) => {
-      terminar({ codigo: 2, timeout: false, error: e.code === 'ENOENT' ? `No se encontró "${bin}".` : e.message, codigoError: e.code });
+      terminar({
+        codigo: 2,
+        timeout: false,
+        interrumpida: interrumpida ?? null,
+        senal: null,
+        error: e.code === 'ENOENT' ? `No se encontró "${bin}".` : e.message,
+        codigoError: e.code,
+      });
     });
-    hijo.on('exit', (codigo) => {
-      const resultado = { codigo: porTimeout ? 124 : codigo ?? 1, timeout: porTimeout };
+    hijo.on('exit', (codigo, senal) => {
+      const resultado = {
+        codigo: porTimeout ? 124 : codigo ?? 1,
+        timeout: porTimeout,
+        interrumpida: interrumpida ?? null,
+        senal: senal ?? null,
+      };
       // Esperar un momento a que se vacíe el stdout, pero no a los nietos que lo mantienen abierto.
-      const espera = setTimeout(() => terminar(resultado), ESPERA_STDIO_MS);
+      espera = setTimeout(() => terminar(resultado), ESPERA_STDIO_MS);
       hijo.once('close', () => { clearTimeout(espera); terminar(resultado); });
     });
 

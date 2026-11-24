@@ -196,3 +196,190 @@ test('con commit.gpgsign activado en el repo, orq commitea igual (sin firmar con
   assert.equal(r.codigo, 0, r.error + r.salida);
   assert.equal(delegaciones(ctx)[0].archivos.length, 1);
 });
+
+test('SIGTERM durante preparar elimina worktree, rama, metadatos y proceso sin dejar rastro', async () => {
+  const ctx = entorno();
+  ajustesRepo(ctx, 'preparar:\n  - "touch preparado-en-curso.txt; sleep 37.456"\n');
+  const hijo = spawn(process.execPath, [ORQ, 'delegar', 'implementar'], {
+    cwd: ctx.repo, env: entornoOrq(ctx), stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  hijo.stdin.end('x');
+
+  const dirWts = path.join(ctx.repo, '.claude', 'worktrees');
+  await esperar(() => {
+    if (!fs.existsSync(dirWts)) return false;
+    return fs.readdirSync(dirWts).some((n) => fs.existsSync(path.join(dirWts, n, 'preparado-en-curso.txt')));
+  });
+  hijo.kill('SIGTERM');
+  const codigo = await new Promise((r) => hijo.on('exit', r));
+  assert.equal(codigo, 143);
+
+  await esperar(() => !procesoVivo('sleep 37.456'), 5000);
+  assert.equal(git(ctx, 'branch', '--list', 'delegar/*').trim(), '');
+  assert.equal(fs.existsSync(dirWts) ? fs.readdirSync(dirWts).length : 0, 0);
+  const dirMeta = path.join(ctx.datos, 'logs', 'worktrees');
+  assert.equal(fs.existsSync(dirMeta) ? fs.readdirSync(dirMeta).length : 0, 0);
+  assert.ok(!fs.existsSync(path.join(ctx.datos, 'logs', 'delegaciones.jsonl')));
+});
+
+test('SIGTERM durante validar mantiene el registro de la delegación y descarta restos', async () => {
+  const ctx = entorno();
+  ajustesRepo(ctx, 'validar:\n  - "touch validar-en-curso.txt; sleep 37.789"\n');
+  const hijo = spawn(process.execPath, [ORQ, 'delegar', 'implementar'], {
+    cwd: ctx.repo, env: entornoOrq(ctx), stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  hijo.stdin.end('x');
+
+  const dirWts = path.join(ctx.repo, '.claude', 'worktrees');
+  await esperar(() => {
+    if (!fs.existsSync(dirWts)) return false;
+    return fs.readdirSync(dirWts).some((n) => fs.existsSync(path.join(dirWts, n, 'validar-en-curso.txt')));
+  });
+  hijo.kill('SIGTERM');
+  const codigo = await new Promise((r) => hijo.on('exit', r));
+  assert.equal(codigo, 143);
+
+  await esperar(() => !procesoVivo('sleep 37.789'), 5000);
+  const [ev] = delegaciones(ctx);
+  assert.ok(ev, 'la delegación completada sigue registrada en delegaciones.jsonl');
+  assert.equal(ev.archivos.length, 1);
+  assert.equal(ev.validacion.ok, false);
+  assert.equal(ev.validacion.comandos[0].interrumpida, 'SIGTERM');
+  assert.match(ev.alertas.join(' '), /validar interrumpido \(SIGTERM\)/);
+  assert.ok(!fs.existsSync(path.join(ctx.repo, ev.worktree, 'validar-en-curso.txt')));
+  const dirMeta = path.join(ctx.datos, 'logs', 'worktrees');
+  assert.deepEqual(fs.readdirSync(dirMeta).filter((n) => n.endsWith('.lock')), []);
+});
+
+test('orq validar descarta archivos nuevos en stage (git add nuevo.txt) y soporta --timeout', () => {
+  const ctx = entorno({ sandbox: 'desactivado' });
+  assert.equal(orq(ctx, ['delegar', 'implementar'], { entrada: 'x' }).codigo, 0);
+  const [ev] = delegaciones(ctx);
+  const wt = path.join(ctx.repo, ev.worktree);
+
+  const val = orq(ctx, ['validar', ev.tarea, '--', 'mkdir -p temporal && echo hola > temporal/nuevo.txt && git add temporal/nuevo.txt && echo extra >> README.md']);
+  assert.equal(val.codigo, 0, val.error + val.salida);
+  assert.match(val.salida, /aviso: quedaron cambios que git no ignora y se descartaron:.*temporal\/nuevo\.txt/);
+  assert.ok(!fs.existsSync(path.join(wt, 'temporal')));
+  assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: wt, encoding: 'utf8' }).trim(), '');
+
+  const malTimeout = orq(ctx, ['validar', ev.tarea, '--timeout', '0', '--', 'true']);
+  assert.equal(malTimeout.codigo, 2);
+  const timeout = orq(ctx, ['validar', ev.tarea, '--timeout', '0.02', '--', 'sleep 37.654']);
+  assert.equal(timeout.codigo, 1);
+  assert.match(timeout.salida, /\(timeout\)/);
+  assert.ok(!procesoVivo('sleep 37.654'));
+});
+
+test('orq delegar: NDJSON truncado, subtype max_turns y sin texto salen con 1', () => {
+  const ctx = entorno();
+  const trunc = orq(ctx, ['delegar', 'implementar'], {
+    entrada: 'x', modo: 'ndjson-truncado', env: { CMD_FALSO_AVISO: 'corte abrupto' },
+  });
+  assert.equal(trunc.codigo, 1);
+  assert.match(delegaciones(ctx).at(-1).alertas.join(' '), /Command Code terminó sin evento final JSON: corte abrupto/);
+
+  const maxTurns = orq(ctx, ['delegar', 'implementar'], { entrada: 'x', modo: 'max-turns' });
+  assert.equal(maxTurns.codigo, 1);
+  assert.match(delegaciones(ctx).at(-1).alertas.join(' '), /Command Code reportó un error: max_turns/);
+
+  const vacio = orq(ctx, ['delegar', 'implementar'], { entrada: 'x', modo: 'sin-texto' });
+  assert.equal(vacio.codigo, 1);
+  assert.match(delegaciones(ctx).at(-1).alertas.join(' '), /Command Code terminó sin respuesta/);
+});
+
+test('validar muestra todas las fallas en el resumen y preparar multi-comando se detiene al primer fallo', () => {
+  const ctx = entorno();
+  ajustesRepo(ctx, [
+    'validar:',
+    '  - "echo error-uno >&2; exit 3"',
+    '  - "echo error-dos >&2; exit 4"',
+    '',
+  ].join('\n'));
+  const r = orq(ctx, ['delegar', 'implementar'], { entrada: 'x' });
+  assert.equal(r.codigo, 0, r.error + r.salida);
+  assert.match(r.salida, /validar: ✘ "echo error-uno >&2; exit 3" terminó con código 3/);
+  assert.match(r.salida, /error-uno/);
+  assert.match(r.salida, /validar: ✘ "echo error-dos >&2; exit 4" terminó con código 4/);
+  assert.match(r.salida, /error-dos/);
+  assert.deepEqual(delegaciones(ctx)[0].validacion.comandos.map((c) => c.codigo), [3, 4]);
+
+  ajustesRepo(ctx, [
+    'preparar:',
+    '  - "echo paso1; exit 7"',
+    '  - "echo nunca-debe-correr"',
+    '',
+  ].join('\n'));
+  const prep = orq(ctx, ['delegar', 'tests'], { entrada: 'x' });
+  assert.equal(prep.codigo, 1);
+  assert.match(prep.error, /Falló preparar: "echo paso1; exit 7" terminó con código 7/);
+  const dirSalidas = path.join(ctx.datos, 'logs', 'salidas');
+  const logsPrep = fs.readdirSync(dirSalidas).filter((n) => n.endsWith('.preparar.log'));
+  assert.equal(logsPrep.length, 1);
+  assert.doesNotMatch(fs.readFileSync(path.join(dirSalidas, logsPrep[0]), 'utf8'), /nunca-debe-correr/);
+  assert.equal(git(ctx, 'branch', '--list', 'delegar/*tests*').trim(), '');
+});
+
+test('repo con 0 commits devuelve error claro y --continuar concurrente respeta el lock', async () => {
+  const ctx = entorno();
+  const sinCommits = path.join(ctx.dir, 'repo-vacio');
+  fs.mkdirSync(sinCommits);
+  execFileSync('git', ['init', '-q'], { cwd: sinCommits });
+  const r0 = orq(ctx, ['delegar', 'implementar'], { entrada: 'x', cwd: sinCommits });
+  assert.equal(r0.codigo, 2);
+  assert.match(r0.error, /aún no tiene ningún commit/);
+  assert.ok(!fs.existsSync(ctx.llamadas));
+
+  assert.equal(orq(ctx, ['delegar', 'implementar'], { entrada: 'x' }).codigo, 0);
+  const [ev] = delegaciones(ctx);
+  const hijo = spawn(process.execPath, [ORQ, 'delegar', 'implementar', '--continuar', ev.tarea], {
+    cwd: ctx.repo, env: entornoOrq(ctx, { modo: 'cuelga' }), stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  hijo.stdin.end('y');
+  await esperar(() => fs.existsSync(ctx.llamadas) && fs.readFileSync(ctx.llamadas, 'utf8').trim().split('\n').length >= 2);
+
+  const conc = orq(ctx, ['delegar', 'implementar', '--continuar', ev.tarea], { entrada: 'z' });
+  assert.equal(conc.codigo, 2);
+  assert.match(conc.error, /Ya hay una delegación en curso para la tarea/);
+  assert.equal(fs.readFileSync(ctx.llamadas, 'utf8').trim().split('\n').length, 2);
+
+  hijo.kill('SIGTERM');
+  assert.equal(await new Promise((r) => hijo.on('exit', r)), 143);
+  await esperar(() => !procesoVivo('sleep 37.123'), 5000);
+});
+
+test('integridad: con sandbox activo, cambios externos de IDE/HEAD pasan a alertas; sin sandbox son críticas', async () => {
+  const correrConCambioExterno = async (sandbox) => {
+    const ctx = entorno({ sandbox });
+    const seguir = path.join(path.dirname(ctx.llamadas), 'seguir');
+    const hijo = spawn(process.execPath, [ORQ, 'delegar', 'implementar'], {
+      cwd: ctx.repo,
+      env: entornoOrq(ctx, { env: { CMD_FALSO_ESPERAR: seguir } }),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let salida = '';
+    hijo.stdout.on('data', (d) => { salida += d; });
+    hijo.stdin.end('x');
+
+    await esperar(() => fs.existsSync(ctx.llamadas));
+    fs.mkdirSync(path.join(ctx.repo, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(ctx.repo, '.claude', 'settings.json'), '{"permissions":{}}\n');
+    git(ctx, 'commit', '-q', '--allow-empty', '-m', 'cambio externo del usuario');
+    fs.writeFileSync(seguir, 'ok\n');
+
+    const codigo = await new Promise((r) => hijo.on('exit', r));
+    return { ctx, codigo, salida, ev: delegaciones(ctx)[0] };
+  };
+
+  const sin = await correrConCambioExterno('desactivado');
+  assert.equal(sin.codigo, 5, sin.salida);
+  assert.match(sin.ev.criticas.join(' '), /\.claude\/settings\.json/);
+  assert.match(sin.ev.criticas.join(' '), /checkout principal cambió de commit o de rama/);
+
+  if (!MAC) return;
+  const con = await correrConCambioExterno(undefined);
+  assert.equal(con.codigo, 0, con.salida);
+  assert.deepEqual(con.ev.criticas, []);
+  assert.match(con.ev.alertas.join(' '), /\.claude\/settings\.json/);
+  assert.match(con.ev.alertas.join(' '), /checkout principal cambió de commit o de rama/);
+});

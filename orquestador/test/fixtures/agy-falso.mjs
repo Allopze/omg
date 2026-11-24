@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Imita a Antigravity CLI (agy 1.5.4) para los tests: --version, `agy models` y el modo headless
 // con --input-format/--output-format stream-json, tal como se observó en el binario real.
-//   AGY_FALSO_MODO: escribe (defecto) | error | sin-respuesta | toca-settings | escapa
+//   AGY_FALSO_MODO: escribe (defecto) | error | sin-respuesta | ndjson-truncado | error-evento | toca-settings | escapa
 //   AGY_FALSO_REGISTRO: JSONL donde anota cada llamada { args, cwd, entrada }
 // Escribe solo con --dangerously-skip-permissions y sin --mode plan (como el real con permisos).
 import fs from 'node:fs';
@@ -50,6 +50,14 @@ emitir({ event: 'init', conversation_id: conv, init: { model: modelo, cwd: proce
 if (!SLUGS.includes(modelo)) { resultado('ERROR', '', { error: `unknown model "${modelo}"` }); process.exit(1); }
 const modo = process.env.AGY_FALSO_MODO || 'escribe';
 if (modo === 'error') { resultado('ERROR', '', { error: 'cuota agotada' }); process.exit(1); }
+if (modo === 'ndjson-truncado') {
+  herramienta('read_file');
+  process.exit(0);
+}
+if (modo === 'error-evento') {
+  emitir({ event: 'error', error: { message: 'fallo en stream' } });
+  process.exit(0);
+}
 if (modo === 'sin-respuesta') {
   // Lo que hace agy 1.5.14 cuando en headless se deniega un permiso: respuesta vacía, código 0.
   console.error('jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied.');

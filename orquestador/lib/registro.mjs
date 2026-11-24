@@ -54,11 +54,11 @@ const esObjeto = (x) => x !== null && typeof x === 'object' && !Array.isArray(x)
 export const ejecutorDeFicha = (f) => f?.ejecutor ?? 'command_code';
 
 /**
- * Niveles de effort que acepta un modelo. En Command Code es la lista efforts_aceptados; en Antigravity,
- * las claves del mapa `efforts` (nivel de orq → slug de `agy models`), porque agy codifica el effort en el slug.
+ * Niveles de effort que acepta un modelo. Si declara `efforts` (nivel de orq → nivel/slug del ejecutor),
+ * sus claves son los niveles válidos; si no, la lista `efforts_aceptados`.
  */
 export function effortsDe(f) {
-  return ejecutorDeFicha(f) === 'antigravity' ? Object.keys(esObjeto(f?.efforts) ? f.efforts : {}) : (f?.efforts_aceptados ?? []);
+  return esObjeto(f?.efforts) ? Object.keys(f.efforts) : (f?.efforts_aceptados ?? []);
 }
 
 /** Configuración del sandbox: `sandbox` en la raíz del registro (en la 0.3 estaba en command_code.sandbox). */
@@ -69,11 +69,31 @@ export const seccionSandbox = (r) => r?.sandbox ?? r?.command_code?.sandbox;
 const CLAVES_REGISTRO = [
   'repos_sensibles', 'command_code', 'antigravity', 'sandbox', 'worktrees', 'models', 'roles', 'no_delegables', 'umbrales', 'repo',
 ];
+const CLAVES_SENSIBLES = ['rutas', 'remotos'];
+const CLAVES_COMMAND_CODE = ['bin', 'timeout_min', 'skills_compatibles', 'salida_json', 'sandbox'];
+const CLAVES_ANTIGRAVITY = ['bin', 'timeout_min', 'permitir_cuenta_personal'];
+const CLAVES_EJECUTOR = { command_code: CLAVES_COMMAND_CODE, antigravity: CLAVES_ANTIGRAVITY };
+const CLAVES_SANDBOX = ['modo', 'escritura_extra', 'lectura_denegada', 'lectura_extra', 'preparar_con_credenciales'];
+const CLAVES_WORKTREES = ['ubicacion', 'dir_externo'];
+const CLAVES_UMBRALES = ['promocion', 'degradacion', 'segundo_modelo'];
+const CLAVES_MODELO = [
+  'ejecutor', 'estado', 'permisos', 'repos_sensibles', 'efforts_aceptados', 'efforts', 'fortalezas', 'debilidades',
+];
+const CLAVES_ROL = [
+  'descripcion', 'primario', 'permitidos', 'effort', 'effort_reintento', 'escala_a',
+  'max_intentos', 'yolo', 'max_archivos', 'rutas_permitidas', 'skills',
+];
 
 const esTasa = (x) => typeof x === 'number' && x >= 0 && x <= 1;
 
 export function validarRegistro(r) {
   const errores = [];
+  const verificarClaves = (obj, permitidas, prefijo) => {
+    const extra = Object.keys(obj).filter((k) => !permitidas.includes(k));
+    if (extra.length) {
+      errores.push(`Claves desconocidas en ${prefijo}: ${extra.join(', ')} (válidas: ${permitidas.join(', ')}).`);
+    }
+  };
   if (!esObjeto(r)) throw new ErrorOrquestador('El registro está vacío o no es un objeto YAML.');
   const desconocidas = Object.keys(r).filter((k) => !CLAVES_REGISTRO.includes(k));
   if (desconocidas.length) {
@@ -85,30 +105,47 @@ export function validarRegistro(r) {
     errores.push('`models` debe tener al menos un modelo.');
   }
 
-  for (const [id, f] of Object.entries(models)) {
-    if (!ESTADOS.includes(f?.estado)) errores.push(`models.${id}.estado debe ser ${ESTADOS.join(' | ')}.`);
-    if (!PERMISOS.includes(f?.permisos)) errores.push(`models.${id}.permisos debe ser ${PERMISOS.join(' | ')}.`);
-    if (!SENSIBLES.includes(f?.repos_sensibles)) {
-      errores.push(`models.${id}.repos_sensibles debe ser ${SENSIBLES.join(' | ')}.`);
-    }
-    const ejecutor = ejecutorDeFicha(f);
-    if (!NOMBRES_EJECUTORES.includes(ejecutor)) {
-      errores.push(`models.${id}.ejecutor debe ser ${NOMBRES_EJECUTORES.join(' | ')}.`);
-    } else if (ejecutor === 'antigravity') {
-      if (f.efforts_aceptados !== undefined) {
-        errores.push(`models.${id}: los modelos de Antigravity declaran \`efforts\` (nivel → slug de agy), no efforts_aceptados.`);
+  if (esObjeto(models)) {
+    for (const [id, f] of Object.entries(models)) {
+      if (!esObjeto(f)) {
+        errores.push(`models.${id} debe ser un objeto.`);
+        continue;
       }
-      if (!esObjeto(f.efforts) || Object.keys(f.efforts).length === 0) {
-        errores.push(`models.${id}.efforts debe mapear cada nivel de effort de orq a un slug de \`agy models\`.`);
-      } else {
-        for (const [nivel, slug] of Object.entries(f.efforts)) {
-          if (typeof slug !== 'string' || !slug.trim()) errores.push(`models.${id}.efforts.${nivel} debe ser un slug de agy.`);
+      verificarClaves(f, CLAVES_MODELO, `models.${id}`);
+      if (!ESTADOS.includes(f.estado)) errores.push(`models.${id}.estado debe ser ${ESTADOS.join(' | ')}.`);
+      if (!PERMISOS.includes(f.permisos)) errores.push(`models.${id}.permisos debe ser ${PERMISOS.join(' | ')}.`);
+      if (!SENSIBLES.includes(f.repos_sensibles)) {
+        errores.push(`models.${id}.repos_sensibles debe ser ${SENSIBLES.join(' | ')}.`);
+      }
+      const ejecutor = ejecutorDeFicha(f);
+      if (!NOMBRES_EJECUTORES.includes(ejecutor)) {
+        errores.push(`models.${id}.ejecutor debe ser ${NOMBRES_EJECUTORES.join(' | ')}.`);
+      } else if (ejecutor === 'antigravity') {
+        if (f.efforts_aceptados !== undefined) {
+          errores.push(`models.${id}: los modelos de Antigravity declaran \`efforts\` (nivel → slug de agy), no efforts_aceptados.`);
         }
+        if (!esObjeto(f.efforts) || Object.keys(f.efforts).length === 0) {
+          errores.push(`models.${id}.efforts debe mapear cada nivel de effort de orq a un slug de \`agy models\`.`);
+        } else {
+          for (const [nivel, slug] of Object.entries(f.efforts)) {
+            if (typeof slug !== 'string' || !slug.trim()) errores.push(`models.${id}.efforts.${nivel} debe ser un slug de agy.`);
+          }
+        }
+      } else if (f.efforts !== undefined && f.efforts_aceptados !== undefined) {
+        errores.push(`models.${id}: declara \`efforts\` o \`efforts_aceptados\`, no ambos.`);
+      } else if (f.efforts !== undefined) {
+        if (!esObjeto(f.efforts) || Object.keys(f.efforts).length === 0) {
+          errores.push(`models.${id}.efforts debe mapear cada nivel de effort de orq a un nivel de cmd.`);
+        } else {
+          for (const [nivel, valor] of Object.entries(f.efforts)) {
+            if (typeof valor !== 'string' || !valor.trim()) errores.push(`models.${id}.efforts.${nivel} debe ser un nivel de effort de cmd.`);
+          }
+        }
+      } else if (!Array.isArray(f.efforts_aceptados) || f.efforts_aceptados.length === 0) {
+        errores.push(`models.${id}.efforts_aceptados debe ser una lista no vacía.`);
+      } else if (f.efforts_aceptados.includes('default')) {
+        errores.push(`models.${id}.efforts_aceptados no debe incluir "default": el router siempre pasa un nivel explícito.`);
       }
-    } else if (!Array.isArray(f?.efforts_aceptados) || f.efforts_aceptados.length === 0) {
-      errores.push(`models.${id}.efforts_aceptados debe ser una lista no vacía.`);
-    } else if (f.efforts_aceptados.includes('default')) {
-      errores.push(`models.${id}.efforts_aceptados no debe incluir "default": el router siempre pasa un nivel explícito.`);
     }
   }
 
@@ -116,24 +153,32 @@ export function validarRegistro(r) {
   if (!esObjeto(roles) || Object.keys(roles).length === 0) {
     errores.push('`roles` debe tener al menos un rol.');
   }
-  const modelo = (id) => (esObjeto(models) && Object.hasOwn(models, id) ? models[id] : undefined);
 
   for (const [nombre, rol] of Object.entries(esObjeto(roles) ? roles : {})) {
     const p = `roles.${nombre}`;
-    if (!Array.isArray(rol?.permitidos) || rol.permitidos.length === 0) {
+    if (!esObjeto(rol)) {
+      errores.push(`${p} debe ser un objeto.`);
+      continue;
+    }
+    verificarClaves(rol, CLAVES_ROL, p);
+    if (!Array.isArray(rol.permitidos) || rol.permitidos.length === 0) {
       errores.push(`${p}.permitidos debe ser una lista no vacía.`);
       continue;
     }
     if (!rol.permitidos.includes(rol.primario)) errores.push(`${p}.primario debe estar en ${p}.permitidos.`);
     for (const id of rol.permitidos) {
-      const f = modelo(id);
-      if (!f) {
+      if (!esObjeto(models) || !Object.hasOwn(models, id)) {
         errores.push(`${p}.permitidos incluye "${id}", que no está en models.`);
+        continue;
+      }
+      const f = models[id];
+      if (!esObjeto(f)) {
+        errores.push(`${p}.permitidos incluye "${id}", cuya ficha en models no es un objeto.`);
         continue;
       }
       for (const campo of ['effort', 'effort_reintento']) {
         if (!effortsDe(f).includes(rol[campo])) {
-          const donde = ejecutorDeFicha(f) === 'antigravity' ? 'efforts' : 'efforts_aceptados';
+          const donde = ejecutorDeFicha(f) === 'antigravity' || esObjeto(f.efforts) ? 'efforts' : 'efforts_aceptados';
           errores.push(`${p}.${campo} = "${rol[campo]}" no está en models.${id}.${donde}.`);
         }
       }
@@ -171,24 +216,39 @@ export function validarRegistro(r) {
   if (u !== undefined) {
     if (!esObjeto(u)) errores.push('umbrales debe ser un objeto.');
     else {
+      verificarClaves(u, CLAVES_UMBRALES, 'umbrales');
       const entero = (x) => Number.isInteger(x) && x >= 1;
-      if (u.promocion !== undefined && !(entero(u.promocion?.min_tareas) && esTasa(u.promocion?.tasa_aprobacion))) {
-        errores.push('umbrales.promocion necesita min_tareas (entero >= 1) y tasa_aprobacion (entre 0 y 1).');
+      if (u.promocion !== undefined) {
+        if (esObjeto(u.promocion)) verificarClaves(u.promocion, ['min_tareas', 'tasa_aprobacion'], 'umbrales.promocion');
+        if (!esObjeto(u.promocion) || !(entero(u.promocion.min_tareas) && esTasa(u.promocion.tasa_aprobacion))) {
+          errores.push('umbrales.promocion necesita min_tareas (entero >= 1) y tasa_aprobacion (entre 0 y 1).');
+        }
       }
-      if (u.degradacion !== undefined && !(entero(u.degradacion?.ultimas_tareas) && esTasa(u.degradacion?.tasa_aprobacion))) {
-        errores.push('umbrales.degradacion necesita ultimas_tareas (entero >= 1) y tasa_aprobacion (entre 0 y 1).');
+      if (u.degradacion !== undefined) {
+        if (esObjeto(u.degradacion)) verificarClaves(u.degradacion, ['ultimas_tareas', 'tasa_aprobacion'], 'umbrales.degradacion');
+        if (!esObjeto(u.degradacion) || !(entero(u.degradacion.ultimas_tareas) && esTasa(u.degradacion.tasa_aprobacion))) {
+          errores.push('umbrales.degradacion necesita ultimas_tareas (entero >= 1) y tasa_aprobacion (entre 0 y 1).');
+        }
       }
-      if (u.segundo_modelo !== undefined && !esTasa(u.segundo_modelo?.tasa_escalamiento)) {
-        errores.push('umbrales.segundo_modelo.tasa_escalamiento debe estar entre 0 y 1.');
+      if (u.segundo_modelo !== undefined) {
+        if (esObjeto(u.segundo_modelo)) verificarClaves(u.segundo_modelo, ['tasa_escalamiento'], 'umbrales.segundo_modelo');
+        if (!esObjeto(u.segundo_modelo) || !esTasa(u.segundo_modelo.tasa_escalamiento)) {
+          errores.push('umbrales.segundo_modelo.tasa_escalamiento debe estar entre 0 y 1.');
+        }
       }
     }
   }
 
   const sensibles = r.repos_sensibles;
-  if (sensibles !== undefined) {
-    for (const clave of ['rutas', 'remotos']) {
-      if (sensibles?.[clave] !== undefined && !(Array.isArray(sensibles[clave]) && sensibles[clave].every((x) => typeof x === 'string'))) {
-        errores.push(`repos_sensibles.${clave} debe ser una lista de patrones.`);
+  if (sensibles !== undefined && sensibles !== null) {
+    if (!esObjeto(sensibles)) {
+      errores.push('repos_sensibles debe ser un objeto.');
+    } else {
+      verificarClaves(sensibles, CLAVES_SENSIBLES, 'repos_sensibles');
+      for (const clave of ['rutas', 'remotos']) {
+        if (sensibles[clave] !== undefined && !(Array.isArray(sensibles[clave]) && sensibles[clave].every((x) => typeof x === 'string'))) {
+          errores.push(`repos_sensibles.${clave} debe ser una lista de patrones.`);
+        }
       }
     }
   }
@@ -200,18 +260,19 @@ export function validarRegistro(r) {
       errores.push(`${nombre} debe ser un objeto.`);
       continue;
     }
+    verificarClaves(e, CLAVES_EJECUTOR[nombre], nombre);
     if (e.bin !== undefined && (typeof e.bin !== 'string' || !e.bin.trim())) errores.push(`${nombre}.bin debe ser un comando.`);
     if (e.timeout_min !== undefined && !(typeof e.timeout_min === 'number' && e.timeout_min > 0)) {
       errores.push(`${nombre}.timeout_min debe ser un número mayor que 0.`);
     }
   }
-  const cc = r.command_code ?? {};
+  const cc = esObjeto(r.command_code) ? r.command_code : {};
   for (const clave of ['skills_compatibles', 'salida_json']) {
     if (cc[clave] !== undefined && cc[clave] !== null && typeof cc[clave] !== 'boolean') {
       errores.push(`command_code.${clave} debe ser true, false o null.`);
     }
   }
-  const ag = r.antigravity ?? {};
+  const ag = esObjeto(r.antigravity) ? r.antigravity : {};
   if (ag.permitir_cuenta_personal !== undefined && typeof ag.permitir_cuenta_personal !== 'boolean') {
     errores.push('antigravity.permitir_cuenta_personal debe ser true o false.');
   }
@@ -225,6 +286,7 @@ export function validarRegistro(r) {
     if (!esObjeto(sb)) {
       errores.push(`${prefijo} debe ser un objeto.`);
     } else {
+      verificarClaves(sb, CLAVES_SANDBOX, prefijo);
       if (sb.modo !== undefined && !MODOS_SANDBOX.includes(sb.modo)) {
         errores.push(`${prefijo}.modo debe ser ${MODOS_SANDBOX.join(' | ')}.`);
       }
@@ -233,16 +295,24 @@ export function validarRegistro(r) {
           errores.push(`${prefijo}.${clave} debe ser una lista de rutas.`);
         }
       }
+      if (sb.preparar_con_credenciales !== undefined && typeof sb.preparar_con_credenciales !== 'boolean') {
+        errores.push(`${prefijo}.preparar_con_credenciales debe ser true o false.`);
+      }
     }
   }
 
   const wt = r.worktrees;
   if (wt !== undefined && wt !== null) {
-    if (wt.ubicacion !== undefined && !UBICACIONES_WORKTREE.includes(wt.ubicacion)) {
-      errores.push(`worktrees.ubicacion debe ser ${UBICACIONES_WORKTREE.join(' | ')}.`);
-    }
-    if (wt.dir_externo !== undefined && (typeof wt.dir_externo !== 'string' || !wt.dir_externo.trim())) {
-      errores.push('worktrees.dir_externo debe ser una ruta.');
+    if (!esObjeto(wt)) {
+      errores.push('worktrees debe ser un objeto.');
+    } else {
+      verificarClaves(wt, CLAVES_WORKTREES, 'worktrees');
+      if (wt.ubicacion !== undefined && !UBICACIONES_WORKTREE.includes(wt.ubicacion)) {
+        errores.push(`worktrees.ubicacion debe ser ${UBICACIONES_WORKTREE.join(' | ')}.`);
+      }
+      if (wt.dir_externo !== undefined && (typeof wt.dir_externo !== 'string' || !wt.dir_externo.trim())) {
+        errores.push('worktrees.dir_externo debe ser una ruta.');
+      }
     }
   }
 
@@ -302,6 +372,7 @@ export function resolverDelegacion(registro, { rol, intento = 1, modelo } = {}) 
     intento,
     max_intentos: r.max_intentos,
     effort,
+    effort_cli: ejecutor === 'command_code' && esObjeto(ficha.efforts) ? ficha.efforts[effort] : effort,
     yolo: r.yolo,
     skills: usarSkills ? skillsDeclaradas : [],
     skills_omitidas: usarSkills ? [] : skillsDeclaradas,

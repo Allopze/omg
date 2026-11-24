@@ -1,0 +1,57 @@
+#!/bin/sh
+# Wrapper de swiftc dentro del sandbox-exec de orq (macOS).
+# Desactiva el sandbox anidado de plugins/macros cuando se invoca swiftc directamente.
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+REAL=""
+OLD_IFS=$IFS
+IFS=:
+for d in ${PATH:-}; do
+  [ -z "$d" ] && continue
+  [ "$d" = "$SELF_DIR" ] && continue
+  if [ -x "$d/swiftc" ] && [ ! -d "$d/swiftc" ]; then
+    REAL_DIR=$(CDPATH= cd -- "$d" 2>/dev/null && pwd || true)
+    [ "$REAL_DIR" = "$SELF_DIR" ] && continue
+    REAL="$d/swiftc"
+    break
+  fi
+done
+IFS=$OLD_IFS
+[ -n "$REAL" ] || REAL="/usr/bin/swiftc"
+
+if [ $# -eq 0 ]; then
+  exec "$REAL"
+fi
+
+skip=0
+is_frontend=0
+has_ds=0
+for arg in "$@"; do
+  case "$arg" in
+    -version|--version|-help|--help|-h|-print-target-info)
+      skip=1
+      ;;
+    -frontend)
+      is_frontend=1
+      ;;
+    -disable-sandbox)
+      has_ds=1
+      ;;
+  esac
+done
+
+if [ "$skip" -eq 1 ] || [ "$has_ds" -eq 1 ]; then
+  exec "$REAL" "$@"
+fi
+
+if [ "$is_frontend" -eq 1 ]; then
+  if [ "${1:-}" = "-frontend" ]; then
+    shift
+    exec "$REAL" -frontend -disable-sandbox "$@"
+  fi
+  exec "$REAL" "$@" -disable-sandbox
+fi
+
+exec "$REAL" -Xfrontend -disable-sandbox "$@"

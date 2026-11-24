@@ -21,4 +21,4 @@ else
 fi
 
 tar -xzf "$TMP/repo.tar.gz" --strip-components=1 -C "$TMP"
-exec node "$TMP/instalar.mjs" "$@"
+node "$TMP/instalar.mjs" "$@"

@@ -3,21 +3,100 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { parseArgs } from 'node:util';
 import { cargarRegistro, SALIDA } from '../lib/registro.mjs';
 import {
-  RUTA_REGISTRO, RAIZ_ORQ, dirConfigClaude, rutaSkillGlobal, registroEfectivo, ARCHIVO_REPO,
+  RUTA_REGISTRO, RAIZ_ORQ, DIR_DATOS, dirConfigClaude, rutaSkillGlobal, registroEfectivo, expandirHome, ARCHIVO_REPO,
 } from '../lib/config.mjs';
-import { git, compararVersiones } from '../lib/util.mjs';
+import { raizRepo, compararVersiones, binDisponible, git } from '../lib/util.mjs';
 import { AGENTES, leerVersion } from '../lib/constantes.mjs';
 import { configSandbox, sandboxDisponible } from '../lib/sandbox.mjs';
-import { EJECUTORES, ejecutoresEnUso, versionEjecutor } from '../lib/ejecutores/index.mjs';
+import {
+  EJECUTORES, ejecutoresEnUso, ejecutorRequerido, versionEjecutor, salidaJsonEfectiva,
+} from '../lib/ejecutores/index.mjs';
 import { rutaSettingsAgy } from '../lib/ejecutores/antigravity.mjs';
 
-function enPath(nombre) {
-  return (process.env.PATH ?? '').split(path.delimiter).some((d) => d && fs.existsSync(path.join(d, nombre)));
+export const AYUDA = [
+  'Uso: orq doctor',
+  '',
+  'Diagnostica la instalación global del orquestador (Node, git, registro, ejecutores,',
+  'Fase 0, sandbox, skill, subagentes, PATH y permisos) y, si estás dentro de un repo,',
+  'su configuración efectiva.',
+  '',
+  'Opciones:',
+  '  -h, --help  Muestra esta ayuda.',
+  '',
+].join('\n');
+
+const REINSTALAR = 'Reinstala con: npx -y github:allopze/omg (o instalar.sh / node instalar.mjs)';
+
+const PERMISOS_POR_DEFECTO = {
+  allow: [
+    'Bash(orq delegar *)',
+    'Bash(orq revision *)',
+    'Bash(orq validar *)',
+    'Bash(orq ver *)',
+    'Bash(orq estado)',
+    'Bash(orq estado *)',
+    'Bash(orq scorecard)',
+    'Bash(orq scorecard *)',
+    'Bash(orq doctor)',
+    'Bash(git diff *)',
+    'Bash(git log *)',
+    'Bash(git status)',
+    'Bash(git status *)',
+    'Bash(git worktree list)',
+  ],
+  deny: [
+    'Bash(cmd)',
+    'Bash(cmd *)',
+    'Bash(command-code *)',
+    'Bash(npx command-code *)',
+    'Bash(agy)',
+    'Bash(agy *)',
+    'Edit(~/.gemini/antigravity-cli/settings.json)',
+    'Edit(/{{ORQ_DIR}}/**)',
+    'Edit(./.claude/orquestador.yaml)',
+  ],
+};
+
+function leerPlantillaPermisos() {
+  const ruta = path.join(RAIZ_ORQ, '..', 'permisos.json');
+  try {
+    if (fs.existsSync(ruta)) {
+      const parsed = JSON.parse(fs.readFileSync(ruta, 'utf8'));
+      if (Array.isArray(parsed?.allow) && Array.isArray(parsed?.deny)) return parsed;
+    }
+  } catch { /* usar copia incluida */ }
+  return PERMISOS_POR_DEFECTO;
 }
 
-export async function ejecutar() {
+function sugerenciaPath() {
+  const shell = path.basename(process.env.SHELL ?? '');
+  if (shell === 'zsh') {
+    const zshrc = process.env.ZDOTDIR ? path.join(process.env.ZDOTDIR, '.zshrc') : '~/.zshrc';
+    return `Abre una terminal nueva o ejecuta: source ${zshrc}`;
+  }
+  if (shell === 'bash') {
+    const rc = process.platform === 'darwin' ? '~/.bash_profile' : '~/.bashrc';
+    return `Abre una terminal nueva o ejecuta: source ${rc}`;
+  }
+  if (shell === 'fish') {
+    return 'Abre una terminal nueva o ejecuta: source ~/.config/fish/conf.d/orquestador.fish';
+  }
+  return 'Abre una terminal nueva o agrega la carpeta de orq (p. ej. ~/.local/bin) a tu PATH';
+}
+
+export async function ejecutar(argv = []) {
+  const { values } = parseArgs({
+    args: argv,
+    options: { help: { type: 'boolean', short: 'h', default: false } },
+  });
+  if (values.help) {
+    process.stdout.write(AYUDA);
+    return SALIDA.OK;
+  }
+
   let fallas = 0;
   const ok = (m) => process.stdout.write(`✔ ${m}\n`);
   const mal = (m, sugerencia) => { fallas++; process.stdout.write(`✘ ${m}${sugerencia ? `\n    → ${sugerencia}` : ''}\n`); };
@@ -47,8 +126,13 @@ export async function ejecutar() {
   for (const ej of ejecutores) {
     const bin = ej.bin(registro);
     const v = versionEjecutor(ej, bin);
-    if (!v.instalado) mal(`${ej.etiqueta} no encontrado (${bin})`, ej.instalar);
-    else if (!v.suficiente) mal(`${ej.etiqueta} ${v.version ?? '?'} (se necesita >= ${ej.versionMinima})`, ej.instalar);
+    const requerido = registro ? ejecutorRequerido(registro, ej) : true;
+    if (!v.instalado) {
+      if (!requerido) aviso(`${ej.etiqueta} (opcional) no encontrado (${bin})`, ej.instalar);
+      else mal(`${ej.etiqueta} no encontrado (${bin})`, ej.instalar);
+      continue;
+    }
+    if (!v.suficiente) mal(`${ej.etiqueta} ${v.version ?? '?'} (se necesita >= ${ej.versionMinima})`, ej.instalar);
     else ok(`${ej.etiqueta} ${v.version}`);
     if (registro && ej.nombre !== 'command_code') {
       const acceso = ej.acceso(registro);
@@ -72,11 +156,23 @@ export async function ejecutar() {
   }
 
   if (registro) {
-    const cc = registro.command_code ?? {};
-    const pendientes = ['skills_compatibles', 'salida_json'].filter((k) => cc[k] === null || cc[k] === undefined);
+    const ejCc = EJECUTORES.command_code;
     if (ejecutores.some((e) => e.nombre === 'command_code')) {
-      if (pendientes.length) aviso(`Fase 0 pendiente: falta verificar ${pendientes.join(' y ')}`, 'orq verificar --guardar');
-      else ok(`Skills a Command Code: ${cc.skills_compatibles ? 'sí' : 'no'} · salida JSON con tokens: ${cc.salida_json ? 'sí' : 'no'}`);
+      const cc = registro.command_code ?? {};
+      const binCc = ejCc.bin(registro);
+      const jsonEf = salidaJsonEfectiva(registro, ejCc, binCc);
+      const pendientes = [];
+      if (cc.skills_compatibles === null || cc.skills_compatibles === undefined) pendientes.push('skills_compatibles');
+      if ((cc.salida_json === null || cc.salida_json === undefined) && !jsonEf.automatico) pendientes.push('salida_json');
+      const etiquetaJson = jsonEf.activo
+        ? (jsonEf.automatico ? `sí (auto con cmd ${jsonEf.version})` : 'sí')
+        : 'no';
+      if (pendientes.length) {
+        const notaAuto = jsonEf.automatico ? ` (salida JSON activa automáticamente con cmd ${jsonEf.version})` : '';
+        aviso(`Fase 0 pendiente: falta verificar ${pendientes.join(' y ')}${notaAuto}`, 'orq verificar --capacidades --guardar');
+      } else {
+        ok(`Skills a Command Code: ${cc.skills_compatibles ? 'sí' : 'no'} · salida JSON con tokens: ${etiquetaJson}`);
+      }
     }
 
     const { modo } = configSandbox(registro);
@@ -90,30 +186,66 @@ export async function ejecutar() {
   }
 
   const skill = rutaSkillGlobal();
-  if (!fs.existsSync(skill)) mal(`Falta la skill global en ${skill}`, 'Reinstala con node instalar.mjs');
-  else if (fs.readFileSync(skill, 'utf8').includes('ENRUTAMIENTO:INICIO')) aviso('La skill orquestar es de una versión anterior', 'Reinstala con node instalar.mjs');
+  if (!fs.existsSync(skill)) mal(`Falta la skill global en ${skill}`, REINSTALAR);
+  else if (fs.readFileSync(skill, 'utf8').includes('ENRUTAMIENTO:INICIO')) aviso('La skill orquestar es de una versión anterior', REINSTALAR);
   else ok('Skill orquestar instalada');
 
   const dirAgentes = path.join(dirConfigClaude(), 'agents');
   const faltan = AGENTES.filter((a) => !fs.existsSync(path.join(dirAgentes, `${a}.md`)));
-  if (faltan.length) mal(`Faltan subagentes: ${faltan.join(', ')}`, 'Reinstala con node instalar.mjs');
+  if (faltan.length) mal(`Faltan subagentes: ${faltan.join(', ')}`, REINSTALAR);
   else ok('Subagentes nativos instalados');
 
-  if (enPath('orq')) ok('orq está en el PATH');
-  else aviso('orq no está en el PATH de esta terminal', 'Abre una terminal nueva o ejecuta: source ~/.zshrc');
+  if (binDisponible('orq')) ok('orq está en el PATH');
+  else aviso('orq no está en el PATH de esta terminal', sugerenciaPath());
 
   const rutaSettings = path.join(dirConfigClaude(), 'settings.json');
   try {
     const permisos = JSON.parse(fs.readFileSync(rutaSettings, 'utf8')).permissions ?? {};
-    const tieneAllow = permisos.allow?.includes('Bash(orq delegar *)');
-    const tieneDeny = permisos.deny?.includes('Bash(cmd *)');
-    if (tieneAllow && tieneDeny) ok('Permisos de Claude Code configurados');
-    else mal('Faltan reglas del orquestador en settings.json', 'Reinstala con node instalar.mjs');
+    const destClaude = path.join(dirConfigClaude(), 'orquestador');
+    const plantilla = leerPlantillaPermisos();
+    const faltantes = [];
+    for (const r of plantilla.allow) {
+      if (!(permisos.allow ?? []).includes(r)) faltantes.push(`allow: ${r}`);
+    }
+    for (const r of plantilla.deny) {
+      if (r.includes('{{ORQ_DIR}}')) {
+        const esperada = r.replaceAll('{{ORQ_DIR}}', destClaude);
+        const alt = r.replaceAll('{{ORQ_DIR}}', DIR_DATOS);
+        if (!(permisos.deny ?? []).includes(esperada) && !(permisos.deny ?? []).includes(alt)) {
+          faltantes.push(`deny: ${esperada}`);
+        }
+      } else if (!(permisos.deny ?? []).includes(r)) {
+        faltantes.push(`deny: ${r}`);
+      }
+    }
+    if (!faltantes.length) ok('Permisos de Claude Code configurados');
+    else mal(`Faltan reglas del orquestador en settings.json (${faltantes.length}): ${faltantes.join(', ')}`, REINSTALAR);
+
+    if (registro?.worktrees?.ubicacion === 'externa') {
+      const dirExternoCrudo = registro.worktrees.dir_externo ?? '~/.orquestador/worktrees';
+      const dirExterno = path.resolve(expandirHome(dirExternoCrudo));
+      const adicionales = Array.isArray(permisos.additionalDirectories) ? permisos.additionalDirectories : [];
+      const cubierto = adicionales.some((d) => {
+        if (typeof d !== 'string' || !d.trim()) return false;
+        const abs = path.resolve(expandirHome(d));
+        return dirExterno === abs || dirExterno.startsWith(`${abs}${path.sep}`);
+      });
+      if (cubierto) ok(`Worktrees externos cubiertos en permissions.additionalDirectories (${dirExternoCrudo})`);
+      else {
+        aviso(
+          `worktrees.ubicacion es "externa" pero "${dirExternoCrudo}" no está en permissions.additionalDirectories de ${rutaSettings}`,
+          `Agrega "${dirExternoCrudo}" a permissions.additionalDirectories en ${rutaSettings} para que los subagentes puedan editar allí`,
+        );
+      }
+    }
   } catch {
-    mal(`No se pudo leer ${rutaSettings}`, 'Reinstala con node instalar.mjs');
+    mal(`No se pudo leer ${rutaSettings}`, REINSTALAR);
   }
 
-  const raiz = git(['rev-parse', '--show-toplevel'], process.cwd(), { permitirFallo: true });
+  let raiz = null;
+  try {
+    raiz = raizRepo();
+  } catch { /* fuera de un repositorio git */ }
   if (raiz && registro) {
     process.stdout.write(`\nRepo actual: ${raiz}\n`);
     if (fs.existsSync(path.join(raiz, '.claude', 'orquestador', 'bin'))) {

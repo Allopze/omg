@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -107,10 +108,14 @@ export function leerJsonl(rutaJsonl) {
     });
 }
 
-export function leerStdin() {
+export async function leerStdin() {
   if (process.stdin.isTTY) return '';
   try {
-    return fs.readFileSync(0, 'utf8');
+    const trozos = [];
+    for await (const c of process.stdin) {
+      trozos.push(typeof c === 'string' ? Buffer.from(c, 'utf8') : c);
+    }
+    return Buffer.concat(trozos).toString('utf8');
   } catch {
     return '';
   }
@@ -127,10 +132,15 @@ export function hashArchivo(ruta) {
     return null;
   }
   const h = crypto.createHash('sha256');
-  if (info.isSymbolicLink()) h.update(`enlace:${fs.readlinkSync(ruta)}`);
-  else if (info.isDirectory()) h.update('directorio');
-  else if (info.size > LIMITE_HASH) h.update(`grande:${info.size}:${info.mtimeMs}`);
-  else h.update(fs.readFileSync(ruta));
+  try {
+    if (info.isSymbolicLink()) h.update(`enlace:${fs.readlinkSync(ruta)}`);
+    else if (info.isDirectory()) h.update('directorio');
+    else if (info.size > LIMITE_HASH) h.update(`grande:${info.size}:${info.mtimeMs}`);
+    else h.update(fs.readFileSync(ruta));
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return null;
+    throw e;
+  }
   return h.digest('hex');
 }
 
@@ -164,22 +174,63 @@ export function hashArbol(dir, { contenido = true, excluir = [] } = {}) {
       if (!rel && excluir.includes(nombre)) continue;
       const r = path.join(rel, nombre);
       const abs = path.join(dir, r);
-      const info = fs.lstatSync(abs);
+      let info;
+      try {
+        info = fs.lstatSync(abs);
+      } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
+          h.update(`?\0${r}\0`);
+          continue;
+        }
+        throw e;
+      }
       if (info.isDirectory()) {
         h.update(`d\0${r}\0`);
         recorrer(r);
       } else if (contenido) h.update(`f\0${r}\0${hashArchivo(abs)}\0`);
-      else h.update(`f\0${r}\0${info.size}\0${info.mtimeMs}\0${info.isSymbolicLink() ? fs.readlinkSync(abs) : ''}\0`);
+      else {
+        let enlace = '';
+        if (info.isSymbolicLink()) {
+          try {
+            enlace = fs.readlinkSync(abs);
+          } catch (e) {
+            if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
+              h.update(`?\0${r}\0`);
+              continue;
+            }
+            throw e;
+          }
+        }
+        h.update(`f\0${r}\0${info.size}\0${info.mtimeMs}\0${enlace}\0`);
+      }
     }
   };
   recorrer('');
   return h.digest('hex');
 }
 
-/** true si `bin` es una ruta existente o un comando que está en el PATH. */
+function esArchivoEjecutable(p) {
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function expandirTilde(p) {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/** true si `bin` es una ruta ejecutable existente o un comando ejecutable en el PATH. */
 export function binDisponible(bin) {
-  if (bin.includes(path.sep)) return fs.existsSync(bin);
-  return (process.env.PATH ?? '').split(path.delimiter).some((d) => d && fs.existsSync(path.join(d, bin)));
+  if (!bin || typeof bin !== 'string') return false;
+  const ruta = expandirTilde(bin);
+  if (ruta.includes(path.sep)) return esArchivoEjecutable(ruta);
+  return (process.env.PATH ?? '').split(path.delimiter).some((d) => d && esArchivoEjecutable(path.join(expandirTilde(d), ruta)));
 }
 
 /** Compara versiones tipo "1.2.3"; devuelve -1, 0 o 1. */

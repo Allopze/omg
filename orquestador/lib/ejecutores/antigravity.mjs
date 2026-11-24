@@ -15,25 +15,41 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { VERSION_MINIMA_AGY } from '../constantes.mjs';
+import { expandirHome } from '../config.mjs';
 import { extraerUso } from '../registro.mjs';
+
+const MAX_STDOUT_COLA = 10;
 
 /** settings.json de agy (ORQ_AGY_SETTINGS permite aislarlo en tests). */
 export const rutaSettingsAgy = () =>
   process.env.ORQ_AGY_SETTINGS || path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json');
 
 function leerSettings() {
+  const ruta = rutaSettingsAgy();
+  let contenido;
   try {
-    return JSON.parse(fs.readFileSync(rutaSettingsAgy(), 'utf8'));
-  } catch {
-    return null;
+    contenido = fs.readFileSync(ruta, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return { settings: null, avisoSettings: null };
+    return { settings: null, avisoSettings: `No se pudo leer ${ruta}: ${e.message}` };
+  }
+  try {
+    const parsed = JSON.parse(contenido);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { settings: null, avisoSettings: `${ruta} no contiene un objeto JSON válido.` };
+    }
+    return { settings: parsed, avisoSettings: null };
+  } catch (e) {
+    return { settings: null, avisoSettings: `${ruta} no es JSON válido (${e.message}); se asume cuenta personal.` };
   }
 }
 
 /** Cómo se autentica agy: API key de AI Studio, credenciales de Google Cloud (ADC) o el login personal. */
 export function autenticacionAgy() {
   if (process.env.AGY_ADC_AUTH === 'true') return 'adc';
-  if (leerSettings()?.modelProvider === 'gemini') return 'api_key';
+  if (leerSettings().settings?.modelProvider === 'gemini') return 'api_key';
   return 'cuenta_personal';
 }
 
@@ -44,45 +60,75 @@ const ETIQUETAS_MODO = {
 };
 
 /** Lector del stream NDJSON de agy. */
-export function crearLectorAgy() {
+export function crearLectorAgy({ alEvento } = {}) {
+  const decoder = new StringDecoder('utf8');
   let pendiente = '';
   let resultado = null;
+  let errorEvento = null;
   const herramientas = {};
+  const stdoutCola = [];
 
   const procesar = (linea) => {
-    if (!linea.trim()) return;
+    const limpia = linea.trim();
+    if (!limpia) return;
     let obj;
     try {
-      obj = JSON.parse(linea);
+      obj = JSON.parse(limpia);
     } catch {
+      stdoutCola.push(limpia);
+      if (stdoutCola.length > MAX_STDOUT_COLA) stdoutCola.shift();
       return;
     }
     if (obj?.event === 'result') resultado = obj.result ?? null;
     else if (obj?.event === 'step_update') {
       const s = obj.step_update;
-      if (s?.tool_name && s.state === 'DONE') herramientas[s.tool_name] = (herramientas[s.tool_name] ?? 0) + 1;
+      if (s?.tool_name) {
+        if (s.state === 'DONE') herramientas[s.tool_name] = (herramientas[s.tool_name] ?? 0) + 1;
+        alEvento?.({ tipo: 'herramienta', nombre: s.tool_name });
+      }
+    } else if (obj?.event === 'error') {
+      const msg = obj.error?.message || obj.error || obj.message;
+      errorEvento = typeof msg === 'string' ? msg : (msg ? JSON.stringify(msg) : 'error sin detalle');
     }
   };
 
   return {
     agregar(trozo) {
-      pendiente += trozo.toString();
+      if (trozo === undefined || trozo === null) return;
+      pendiente += decoder.write(trozo);
       const lineas = pendiente.split('\n');
       pendiente = lineas.pop();
       for (const l of lineas) procesar(l);
     },
     terminar() {
-      procesar(pendiente);
+      pendiente += decoder.end();
+      const lineas = pendiente.split('\n');
       pendiente = '';
+      for (const l of lineas) procesar(l);
+
+      const texto = typeof resultado?.response === 'string'
+        ? resultado.response
+        : String(resultado?.response ?? '');
       const fallo = resultado && resultado.status !== 'SUCCESS';
+      let error = null;
+      if (fallo) {
+        const detalle = resultado.error
+          ? (typeof resultado.error === 'string' ? resultado.error : (resultado.error?.message || JSON.stringify(resultado.error)))
+          : '';
+        error = `estado ${resultado.status}${detalle ? `: ${detalle}` : ''}`;
+      } else if (!resultado && errorEvento) {
+        error = errorEvento;
+      }
+
       return {
         resultado,
-        texto: resultado?.response ?? '',
+        texto,
         estado: resultado?.status ?? null,
-        error: fallo ? `estado ${resultado.status}${resultado.error ? `: ${resultado.error}` : ''}` : null,
+        error,
         uso: resultado ? extraerUso(resultado.usage) : null,
         usoBruto: resultado?.usage ?? null,
         herramientas: Object.keys(herramientas).length ? herramientas : null,
+        stdoutCola,
       };
     },
   };
@@ -94,7 +140,7 @@ export const antigravity = {
   versionMinima: VERSION_MINIMA_AGY,
   instalar: 'https://antigravity.google/docs/install/',
 
-  bin: (registro) => process.env.ORQ_AGY_BIN || registro?.antigravity?.bin || 'agy',
+  bin: (registro) => expandirHome(process.env.ORQ_AGY_BIN || registro?.antigravity?.bin || 'agy'),
   config: (registro) => registro?.antigravity ?? {},
 
   /**
@@ -113,7 +159,7 @@ export const antigravity = {
   },
 
   entrada: (prompt) => `${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`,
-  lector: () => crearLectorAgy(),
+  lector: (_res, opts) => crearLectorAgy(opts),
 
   estado: () => ({
     escritura: ['~/.gemini/antigravity-cli', '~/.gemini/antigravity'],
@@ -129,11 +175,15 @@ export const antigravity = {
    * supported under consumer plans". orq lo permite solo si el usuario lo habilitó en el registro.
    */
   acceso(registro) {
-    const modo = autenticacionAgy();
+    const { settings, avisoSettings } = leerSettings();
+    const modo = process.env.AGY_ADC_AUTH === 'true'
+      ? 'adc'
+      : (settings?.modelProvider === 'gemini' ? 'api_key' : 'cuenta_personal');
     const permitido = modo !== 'cuenta_personal' || registro?.antigravity?.permitir_cuenta_personal === true;
     return {
       modo,
       etiquetaModo: ETIQUETAS_MODO[modo],
+      avisoSettings,
       bloqueo: permitido ? null : (
         'agy usa tu cuenta personal de Google y el registro no lo permite (antigravity.permitir_cuenta_personal). ' +
         'El FAQ de Antigravity dice que envolver agy en otras aplicaciones no está soportado en planes de consumo. ' +
@@ -145,7 +195,11 @@ export const antigravity = {
 
   catalogo(bin) {
     const r = spawnSync(bin, ['models'], { encoding: 'utf8', timeout: 60000 });
-    return r.status === 0 ? `${r.stdout ?? ''}` : null;
+    return {
+      ok: r.status === 0 && !r.error,
+      salida: r.stdout ?? '',
+      error: r.error?.message || (r.status !== 0 ? (r.stderr?.trim() || `código ${r.status}`) : null),
+    };
   },
 
   /** Slugs que deben aparecer en `agy models` para un modelo del registro. */

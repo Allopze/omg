@@ -39,11 +39,12 @@ function rutasProtegidas(raiz, wt) {
   return [
     // Configuración de git: si cambia, orq no vuelve a ejecutar git.
     ...[path.join(comun, 'config'), path.join(home, '.gitconfig'), path.join(home, '.config', 'git', 'config'),
-      ...(wt ? [path.join(wt, '.git')] : [])].map((ruta) => ({ ruta, git: true, tipo: 'archivo' })),
-    { ruta: path.join(comun, 'hooks'), git: true, tipo: 'dir' },
+      ...(wt ? [path.join(wt, '.git')] : [])].map((ruta) => ({ ruta, git: true, tipo: 'archivo', criticaEnSandbox: true })),
+    { ruta: path.join(comun, 'hooks'), git: true, tipo: 'dir', criticaEnSandbox: true },
+    { ruta: RUTA_REGISTRO, git: false, tipo: 'archivo', criticaEnSandbox: true },
     ...[
-      // Claude Code: permisos e instrucciones globales; permisos y ajustes del repo; el registro de orq.
-      path.join(claude, 'settings.json'), path.join(claude, 'settings.local.json'), path.join(claude, 'CLAUDE.md'), RUTA_REGISTRO,
+      // Claude Code: permisos e instrucciones globales; permisos y ajustes del repo.
+      path.join(claude, 'settings.json'), path.join(claude, 'settings.local.json'), path.join(claude, 'CLAUDE.md'),
       path.join(raiz, '.claude', 'settings.json'), path.join(raiz, '.claude', 'settings.local.json'), path.join(raiz, ARCHIVO_REPO),
       // Command Code: configuración, instrucciones y confianza en hooks de proyecto.
       ...['settings.json', 'settings.local.json', 'AGENTS.md', 'mcp.json', 'trusted-hooks.json'].map((n) => path.join(cc, n)),
@@ -53,19 +54,20 @@ function rutasProtegidas(raiz, wt) {
       // Archivos de shell y el comando orq.
       ...['.zshrc', '.zprofile', '.bashrc', '.bash_profile', '.profile', '.config/fish/config.fish'].map((n) => path.join(home, n)),
       ...(shim ? [shim] : []),
-    ].map((ruta) => ({ ruta, git: false, tipo: 'archivo' })),
+    ].map((ruta) => ({ ruta, git: false, tipo: 'archivo', criticaEnSandbox: false })),
     // Instrucciones, scripts y binarios que otra sesión ejecutaría o leería después.
     ...[
-      path.join(gemini, 'skills'), path.join(gemini, 'config', 'skills'), path.join(gemini, 'antigravity-cli', 'skills'),
+      path.join(gemini, 'antigravity-cli', 'skills'),
       path.join(gemini, 'antigravity-cli', 'bin'), path.join(gemini, 'antigravity', 'bin'),
       ...['taste', 'scripts', '.cc-global-pack'].map((n) => path.join(cc, n)),
-    ].map((ruta) => ({ ruta, git: false, tipo: 'arbol' })),
-    // Carpetas grandes (las skills de Claude Code pueden ser miles de archivos) y el código del orquestador.
+    ].map((ruta) => ({ ruta, git: false, tipo: 'arbol', criticaEnSandbox: false })),
+    // Carpetas grandes (skills/plugins de Claude, Gemini y Command Code) y el código del orquestador.
     ...[
+      path.join(gemini, 'skills'), path.join(gemini, 'config', 'skills'),
       ...['skills', 'agents', 'commands', 'plugins'].map((n) => path.join(claude, n)),
       ...['hooks', 'agents', 'commands', 'skills'].map((n) => path.join(cc, n)),
-    ].map((ruta) => ({ ruta, git: false, tipo: 'meta' })),
-    { ruta: RAIZ_ORQ, git: false, tipo: 'meta', excluir: ['logs', 'models.yaml', 'models.yaml.nuevo', 'models.yaml.anterior'] },
+    ].map((ruta) => ({ ruta, git: false, tipo: 'meta', criticaEnSandbox: false })),
+    { ruta: RAIZ_ORQ, git: false, tipo: 'meta', criticaEnSandbox: true, excluir: ['logs', 'models.yaml', 'models.yaml.nuevo', 'models.yaml.anterior'] },
   ];
 }
 
@@ -106,28 +108,33 @@ export function huellaGit(raiz, wt) {
 }
 
 /** Compara la fase de archivos. `gitComprometido` indica que no se debe volver a ejecutar git. */
-export function compararArchivos(antes, despues) {
+export function compararArchivos(antes, despues, { sandboxActivo = false } = {}) {
   const criticas = [];
+  const alertas = [];
   let gitComprometido = false;
   despues.entradas.forEach((e, i) => {
     if (e.hash === antes.entradas[i].hash) return;
-    criticas.push(`Se modificó ${corto(e.ruta)}${e.git ? ' (configuración de git: no se ejecutó git add ni commit)' : ''}.`);
+    const msg = `Se modificó ${corto(e.ruta)}${e.git ? ' (configuración de git: no se ejecutó git add ni commit)' : ''}.`;
+    if (sandboxActivo && !e.criticaEnSandbox) alertas.push(msg);
+    else criticas.push(msg);
     if (e.git) gitComprometido = true;
   });
-  return { criticas, gitComprometido };
+  return { criticas, alertas, gitComprometido };
 }
 
 /**
  * Compara la fase de git. Cambios en el checkout principal son alerta (podrías estar editando tú);
- * mover el HEAD principal o cambiar la rama del worktree es crítico.
+ * mover el HEAD principal sin sandbox o cambiar la rama del worktree es crítico.
  */
-export function compararGit(antes, despues, { ramaEsperada, soloLectura }) {
+export function compararGit(antes, despues, { ramaEsperada, soloLectura, sandboxActivo = false } = {}) {
   const criticas = [];
   const alertas = [];
   const p0 = antes.principal;
   const p1 = despues.principal;
   if (p0.head !== p1.head || p0.rama !== p1.rama) {
-    criticas.push(`El checkout principal cambió de commit o de rama (${p0.rama ?? p0.head?.slice(0, 12)} → ${p1.rama ?? p1.head?.slice(0, 12)}).`);
+    const msg = `El checkout principal cambió de commit o de rama (${p0.rama ?? p0.head?.slice(0, 12)} → ${p1.rama ?? p1.head?.slice(0, 12)}).`;
+    if (sandboxActivo) alertas.push(msg);
+    else criticas.push(msg);
   } else if (p0.contenido !== p1.contenido) {
     const nuevas = p1.rutas.filter((r) => !p0.rutas.includes(r));
     const detalle = nuevas.length ? nuevas.join(', ') : 'archivos que ya tenían cambios sin commit';

@@ -26,18 +26,21 @@ if [ $# -eq 0 ]; then
 fi
 
 case "$1" in
-  build|test|run)
+  build|test|run|package)
     sub=$1
     shift
     skip=0
     has_ds=0
     has_fe_ds=0
+    [ "$sub" = "package" ] && has_fe_ds=1
     for arg in "$@"; do
       case "$arg" in
         --) break ;;
         -h|--help|-help) skip=1 ;;
         --disable-sandbox) has_ds=1 ;;
         -disable-sandbox) has_fe_ds=1 ;;
+        -*) ;;
+        *) [ "$sub" = "run" ] && break ;;
       esac
     done
     if [ "$skip" -eq 1 ]; then

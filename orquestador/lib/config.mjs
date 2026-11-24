@@ -9,7 +9,7 @@ import { RAIZ_ORQ } from './constantes.mjs';
 export { RAIZ_ORQ };
 
 /** Carpeta de datos: models.yaml y logs. ORQ_HOME permite aislarla en tests. */
-export const DIR_DATOS = process.env.ORQ_HOME ? path.resolve(process.env.ORQ_HOME) : RAIZ_ORQ;
+export const DIR_DATOS = process.env.ORQ_HOME ? path.resolve(expandirHome(process.env.ORQ_HOME)) : RAIZ_ORQ;
 export const RUTA_REGISTRO = path.join(DIR_DATOS, 'models.yaml');
 export const ARCHIVO_REPO = path.join('.claude', 'orquestador.yaml');
 
@@ -25,7 +25,9 @@ export function dirConfigClaude() {
 }
 
 export function rutaSkillGlobal() {
-  return process.env.ORQ_SKILL || path.join(dirConfigClaude(), 'skills', 'orquestar', 'SKILL.md');
+  return process.env.ORQ_SKILL
+    ? path.resolve(expandirHome(process.env.ORQ_SKILL))
+    : path.join(dirConfigClaude(), 'skills', 'orquestar', 'SKILL.md');
 }
 
 export function rutasLogs() {
@@ -47,9 +49,12 @@ export function dirWorktrees(registro, raiz) {
   return path.join(base, `${path.basename(raiz)}-${huella}`);
 }
 
+const sinBarraFinal = (p) => (p.length > 1 ? p.replace(/\/+$/, '') || '/' : p);
+
 /** Glob simple (* y ?) a expresión regular, sin distinguir mayúsculas. */
 export function globARegex(glob) {
-  const esc = expandirHome(glob).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+  const norm = sinBarraFinal(expandirHome(glob));
+  const esc = norm.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
   return new RegExp(`^${esc}$`, 'i');
 }
 
@@ -79,22 +84,25 @@ export function cargarAjustesRepo(raiz, registro) {
       errores.push(`"${clave}" debe ser una lista de comandos.`);
     }
   }
-  if (datos.roles !== undefined && datos.roles !== null && (typeof datos.roles !== 'object' || Array.isArray(datos.roles))) {
-    errores.push('"roles" debe ser un mapa de rol a ajustes.');
-  }
-  for (const [rol, campos] of Object.entries(datos.roles ?? {})) {
-    // Object.hasOwn: "__proto__", "constructor" o "toString" no son roles (y __proto__ contaminaría Object.prototype).
-    if (!Object.hasOwn(registro.roles, rol)) {
-      errores.push(`El rol "${rol}" no existe en el registro global.`);
-      continue;
-    }
-    if (campos !== null && (typeof campos !== 'object' || Array.isArray(campos))) {
-      errores.push(`roles.${rol} debe ser un mapa de campo a valor.`);
-      continue;
-    }
-    for (const campo of Object.keys(campos ?? {})) {
-      if (!CAMPOS_ROL_AJUSTABLES.includes(campo)) {
-        errores.push(`roles.${rol}.${campo} no se puede ajustar por repo (permitidos: ${CAMPOS_ROL_AJUSTABLES.join(', ')}).`);
+  if (datos.roles !== undefined && datos.roles !== null) {
+    if (typeof datos.roles !== 'object' || Array.isArray(datos.roles)) {
+      errores.push('"roles" debe ser un mapa de rol a ajustes.');
+    } else {
+      for (const [rol, campos] of Object.entries(datos.roles)) {
+        // Object.hasOwn: "__proto__", "constructor" o "toString" no son roles (y __proto__ contaminaría Object.prototype).
+        if (!Object.hasOwn(registro.roles, rol)) {
+          errores.push(`El rol "${rol}" no existe en el registro global.`);
+          continue;
+        }
+        if (campos !== null && (typeof campos !== 'object' || Array.isArray(campos))) {
+          errores.push(`roles.${rol} debe ser un mapa de campo a valor.`);
+          continue;
+        }
+        for (const campo of Object.keys(campos ?? {})) {
+          if (!CAMPOS_ROL_AJUSTABLES.includes(campo)) {
+            errores.push(`roles.${rol}.${campo} no se puede ajustar por repo (permitidos: ${CAMPOS_ROL_AJUSTABLES.join(', ')}).`);
+          }
+        }
       }
     }
   }
@@ -113,18 +121,24 @@ export function remotosGit(raiz) {
  * "~/dev/privado*" tiene que coincidir aunque ~/dev sea un enlace a otro disco.
  */
 export function variantesPatronRuta(patron) {
-  const expandido = expandirHome(patron);
+  const expandido = sinBarraFinal(expandirHome(patron));
   const comodin = expandido.search(/[*?]/);
+  const variantes = [expandido];
+  const agregarReal = (prefijo) => {
+    if (!prefijo) return false;
+    try {
+      const real = fs.realpathSync(prefijo);
+      if (real !== prefijo) variantes.push(sinBarraFinal(real + expandido.slice(prefijo.length)));
+      return true;
+    } catch {
+      return false; /* el prefijo no existe: solo el patrón tal cual */
+    }
+  };
+  if (comodin === -1 && agregarReal(expandido)) return variantes;
   const literal = comodin === -1 ? expandido : expandido.slice(0, comodin);
   const corte = literal.endsWith(path.sep) ? literal.length - 1 : literal.lastIndexOf(path.sep);
   const prefijo = expandido.slice(0, Math.max(corte, 0));
-  const variantes = [expandido];
-  try {
-    if (prefijo) {
-      const real = fs.realpathSync(prefijo);
-      if (real !== prefijo) variantes.push(real + expandido.slice(prefijo.length));
-    }
-  } catch { /* el prefijo no existe: solo el patrón tal cual */ }
+  agregarReal(prefijo);
   return variantes;
 }
 
@@ -152,7 +166,11 @@ export function registroEfectivo(raiz, { rutaRegistro = RUTA_REGISTRO, remotos }
   const global = cargarRegistro(rutaRegistro);
   const ajustes = cargarAjustesRepo(raiz, global);
   const efectivo = structuredClone(global);
-  for (const [rol, campos] of Object.entries(ajustes?.datos?.roles ?? {})) Object.assign(efectivo.roles[rol], campos);
+  for (const [rol, campos] of Object.entries(ajustes?.datos?.roles ?? {})) {
+    for (const [campo, valor] of Object.entries(campos ?? {})) {
+      if (valor !== null && valor !== undefined) efectivo.roles[rol][campo] = valor;
+    }
+  }
   const sensibilidad = detectarSensible(global, raiz, ajustes, remotos);
   efectivo.repo = { sensible: sensibilidad.sensible };
   try {

@@ -57,6 +57,8 @@ const REGISTROS_PUBLICADOS = [
   '1d65eb4dae62c967b6d8d079e302030cd913fb5dc584f96f063cf83fd0867dae', // 0.4.0 (primera publicación)
   'f53a1816a7e8a0094814f9e0eb378ec5224931e84bada00bae9a0e3ba1cce76d', // 0.4.0
   'bbc5dc8000390572ba92460fc9d0c3ca020cf20434452301bd582a24d2ad1778', // 0.4.1 (pre-publicación)
+  '6a6201a22c80cbbed2eb302c45804cae3fca844e7b91e54e5fa5c848141f8a70', // 0.4.1
+  '8d5a1983172217096795a523749e9de053898ff9938d9f698dffa039fc6278d8', // 0.4.1 (actual)
 ];
 
 function fallar(mensaje) {
@@ -67,13 +69,17 @@ const paso = (m) => process.stdout.write(`${OPC.simular ? '· (simulado) ' : '·
 const nota = (m) => process.stdout.write(`  ${m}\n`);
 const hacer = (fn) => { if (!OPC.simular) fn(); };
 const hash = (ruta) => crypto.createHash('sha256').update(fs.readFileSync(ruta)).digest('hex');
+const shQuote = (s) => `'${s.replace(/'/g, "'\\''")}'`;
 const leerJson = (ruta, porDefecto) => (fs.existsSync(ruta) ? JSON.parse(fs.readFileSync(ruta, 'utf8')) : porDefecto);
 const escribirJson = (ruta, datos) => fs.writeFileSync(ruta, `${JSON.stringify(datos, null, 2)}\n`);
 const corto = (p) => (p.startsWith(HOME) ? `~${p.slice(HOME.length)}` : p);
+const leerPlantillaPermisos = () => JSON.parse(
+  fs.readFileSync(path.join(ORIGEN, 'permisos.json'), 'utf8').replaceAll('{{ORQ_DIR}}', JSON.stringify(DEST).slice(1, -1)),
+);
 
 function comando(bin, args, opciones = {}) {
   const r = spawnSync(bin, args, { encoding: 'utf8', ...opciones });
-  return r.error ? null : `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
+  return r.error || r.status !== 0 ? null : `${r.stdout ?? ''}${r.stderr ?? ''}`.trim();
 }
 
 function archivoShell() {
@@ -137,20 +143,25 @@ if (OPC.desinstalar) {
   for (const a of AGENTES) {
     const ruta = path.join(CONFIG, 'agents', `${a}.md`);
     if (!fs.existsSync(ruta)) continue;
-    const nuestro = man?.agentes?.[a];
+    const origen = path.join(ORIGEN, 'agents', `${a}.md`);
+    const nuestro = man ? man.agentes?.[a] : (fs.existsSync(origen) ? hash(origen) : null);
     if (nuestro && nuestro === hash(ruta)) { paso(`Quitar el subagente ${a}`); hacer(() => fs.rmSync(ruta)); }
     else nota(`Se conserva el subagente ${a}: no lo instaló el orquestador o lo modificaste.`);
   }
 
-  if (man?.reglas && fs.existsSync(RUTA_SETTINGS)) {
-    paso('Quitar las reglas de permisos del orquestador de settings.json');
-    hacer(() => {
-      const s = SETTINGS;
-      for (const clave of ['allow', 'deny']) {
-        if (s.permissions?.[clave]) s.permissions[clave] = s.permissions[clave].filter((r) => !man.reglas[clave]?.includes(r));
-      }
-      escribirJson(RUTA_SETTINGS, s);
-    });
+  const reglas = man?.reglas ?? (fs.existsSync(path.join(ORIGEN, 'permisos.json')) ? leerPlantillaPermisos() : null);
+  if (reglas && fs.existsSync(RUTA_SETTINGS)) {
+    const tieneReglas = ['allow', 'deny'].some((clave) => SETTINGS.permissions?.[clave]?.some((r) => reglas[clave]?.includes(r)));
+    if (tieneReglas) {
+      paso('Quitar las reglas de permisos del orquestador de settings.json');
+      hacer(() => {
+        const s = SETTINGS;
+        for (const clave of ['allow', 'deny']) {
+          if (s.permissions?.[clave]) s.permissions[clave] = s.permissions[clave].filter((r) => !reglas[clave]?.includes(r));
+        }
+        escribirJson(RUTA_SETTINGS, s);
+      });
+    }
   }
 
   if (fs.existsSync(SHIM) && fs.readFileSync(SHIM, 'utf8').includes(MARCA_SHIM)) {
@@ -158,12 +169,16 @@ if (OPC.desinstalar) {
     hacer(() => fs.rmSync(SHIM));
   }
 
-  if (man?.shell?.ruta && fs.existsSync(man.shell.ruta)) {
-    paso(`Quitar la línea de PATH de ${corto(man.shell.ruta)}`);
-    hacer(() => {
-      if (man.shell.tipo === 'fish') fs.rmSync(man.shell.ruta);
-      else fs.writeFileSync(man.shell.ruta, quitarBloque(fs.readFileSync(man.shell.ruta, 'utf8')));
-    });
+  const shell = man?.shell ?? archivoShell();
+  if (shell?.ruta && fs.existsSync(shell.ruta)) {
+    const contenido = shell.tipo === 'fish' ? '' : fs.readFileSync(shell.ruta, 'utf8');
+    if (shell.tipo === 'fish' || contenido.includes(BLOQUE_INI)) {
+      paso(`Quitar la línea de PATH de ${corto(shell.ruta)}`);
+      hacer(() => {
+        if (shell.tipo === 'fish') fs.rmSync(shell.ruta);
+        else fs.writeFileSync(shell.ruta, quitarBloque(contenido));
+      });
+    }
   }
   if (fs.existsSync(DEST)) { paso(`Quitar ${corto(DEST)}`); hacer(() => fs.rmSync(DEST, { recursive: true, force: true })); }
   if (fs.existsSync(`${RUTA_SETTINGS}.bak-orquestador`)) nota(`Queda tu respaldo de settings.json de antes de instalar: ${corto(RUTA_SETTINGS)}.bak-orquestador`);
@@ -218,7 +233,7 @@ hacer(() => {
     else fs.copyFileSync(o, path.join(nuevo, nombre));
   }
   try {
-    execFileSync('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: nuevo, stdio: 'inherit' });
+    execFileSync('npm', ['ci', '--omit=dev', '--prefer-offline', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: nuevo, stdio: 'inherit' });
   } catch {
     fs.rmSync(nuevo, { recursive: true, force: true });
     fallar('Falló npm ci; la instalación anterior quedó intacta. Revisa tu conexión y vuelve a ejecutar el instalador.');
@@ -299,7 +314,7 @@ for (const a of AGENTES) {
 
 // 5. Permisos de Claude Code a nivel de usuario
 const rutaSettings = RUTA_SETTINGS;
-const plantilla = JSON.parse(fs.readFileSync(path.join(ORIGEN, 'permisos.json'), 'utf8').replaceAll('{{ORQ_DIR}}', DEST));
+const plantilla = leerPlantillaPermisos();
 const settings = SETTINGS;
 settings.permissions ??= {};
 const agregadas = { allow: [], deny: [] };
@@ -326,7 +341,24 @@ hacer(() => {
 paso(`Crear el comando ${corto(SHIM)}`);
 hacer(() => {
   fs.mkdirSync(BIN_DIR, { recursive: true });
-  fs.writeFileSync(SHIM, `#!/bin/sh\n${MARCA_SHIM}\nexec node "${path.join(DEST, 'bin', 'orq.mjs')}" "$@"\n`);
+  const shim = [
+    '#!/bin/sh',
+    MARCA_SHIM,
+    "NODE_BIN=''",
+    'if command -v node >/dev/null 2>&1; then',
+    '  VER="$(node -v 2>/dev/null || true)"',
+    '  VER="${VER#v}"',
+    '  VER="${VER%%.*}"',
+    '  case "$VER" in',
+    "    ''|*[!0-9]*) ;;",
+    '    *) if [ "$VER" -ge 20 ]; then NODE_BIN=node; fi ;;',
+    '  esac',
+    'fi',
+    `if [ -z "$NODE_BIN" ]; then NODE_BIN=${shQuote(process.execPath)}; fi`,
+    `exec "$NODE_BIN" ${shQuote(path.join(DEST, 'bin', 'orq.mjs'))} "$@"`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(SHIM, shim);
   fs.chmodSync(SHIM, 0o755);
 });
 
@@ -341,17 +373,25 @@ if (enPath) {
   if (!shell) {
     nota(`No reconocí tu shell (${process.env.SHELL ?? 'desconocido'}). Agrega ${corto(BIN_DIR)} a tu PATH.`);
   } else {
-    const dirShell = BIN_DIR.startsWith(HOME) ? `$HOME${BIN_DIR.slice(HOME.length)}` : BIN_DIR;
-    const linea = shell.tipo === 'fish' ? `fish_add_path ${BIN_DIR}` : `export PATH="${dirShell}:$PATH"`;
+    const dirShell = BIN_DIR === HOME || BIN_DIR.startsWith(`${HOME}/`) ? `$HOME${BIN_DIR.slice(HOME.length)}` : BIN_DIR;
+    const linea = shell.tipo === 'fish' ? `fish_add_path "${dirShell}"` : `export PATH="${dirShell}:$PATH"`;
     const actual = fs.existsSync(shell.ruta) ? fs.readFileSync(shell.ruta, 'utf8') : '';
-    if (actual.includes(BLOQUE_INI)) {
+    if (actual.includes(BLOQUE_INI) && actual.includes(linea)) {
       paso(`El PATH ya está configurado en ${corto(shell.ruta)}`);
     } else {
-      paso(`Agregar ${corto(BIN_DIR)} al PATH en ${corto(shell.ruta)}`);
+      const reemplaza = actual.includes(BLOQUE_INI);
+      paso(`${reemplaza ? 'Actualizar' : 'Agregar'} ${corto(BIN_DIR)} al PATH en ${corto(shell.ruta)}`);
       hacer(() => {
         fs.mkdirSync(path.dirname(shell.ruta), { recursive: true });
-        const sep = actual && !actual.endsWith('\n') ? '\n' : '';
-        fs.appendFileSync(shell.ruta, `${sep}\n${BLOQUE_INI}\n${linea}\n${BLOQUE_FIN}\n`);
+        if (reemplaza) {
+          const limpio = quitarBloque(actual).replace(/\n{2,}$/, '\n');
+          const base = limpio === '\n' ? '' : limpio;
+          const sep = base && !base.endsWith('\n') ? '\n' : '';
+          fs.writeFileSync(shell.ruta, `${base}${sep}\n${BLOQUE_INI}\n${linea}\n${BLOQUE_FIN}\n`);
+        } else {
+          const sep = actual && !actual.endsWith('\n') ? '\n' : '';
+          fs.appendFileSync(shell.ruta, `${sep}\n${BLOQUE_INI}\n${linea}\n${BLOQUE_FIN}\n`);
+        }
       });
     }
     manifiesto.shell = shell;

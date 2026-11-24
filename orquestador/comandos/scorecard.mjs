@@ -1,4 +1,4 @@
-// orq scorecard [--desde AAAA-MM-DD] [--repo NOMBRE | --aqui] [--json]
+// orq scorecard [--desde AAAA-MM-DD] [--repo NOMBRE | --aqui] [--detalle] [--json]
 // Agrega los logs de todos los repos y sugiere cambios a la whitelist según los umbrales del registro.
 // Mide por delegación (aprobación, validación, tokens) y por tarea (intentos hasta resolver, escalamientos).
 // Las sugerencias son propuestas: los cambios a models.yaml los aprueba el usuario.
@@ -9,21 +9,55 @@ import { RUTA_REGISTRO, rutasLogs } from '../lib/config.mjs';
 import { raizRepo, leerJsonl } from '../lib/util.mjs';
 import { mapaRevisiones, resumirTareas, esAprobado } from '../lib/tareas.mjs';
 
+export const AYUDA = [
+  'Uso: orq scorecard [opciones]',
+  '',
+  'Agrega los logs de delegaciones y sugiere cambios a la whitelist según los umbrales',
+  'del registro global.',
+  '',
+  'Opciones:',
+  '  --desde AAAA-MM-DD  Filtra delegaciones y tareas desde esa fecha (medianoche local).',
+  '  --repo NOMBRE       Filtra por nombre de repo.',
+  '  --aqui              Filtra por la raíz exacta del repo actual.',
+  '  --detalle           Muestra las 15 columnas completas en la tabla por delegación.',
+  '  --json              Imprime el resultado en formato JSON.',
+  '  -h, --help          Muestra esta ayuda.',
+  '',
+].join('\n');
+
 const tokensDe = (d) => tokensTotales(d.uso);
 
 /** "AAAA-MM-DD" como medianoche local en ISO (las fechas del log están en UTC). */
 export function desdeComoIso(desde) {
   if (!desde) return null;
-  return desde.includes('T') ? desde : new Date(`${desde}T00:00:00`).toISOString();
+  if (desde.includes('T')) return desde;
+  const m = String(desde).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new ErrorOrquestador('--desde debe tener formato AAAA-MM-DD.', SALIDA.ERROR_USO);
+  const y = Number(m[1]);
+  const mes = Number(m[2]);
+  const d = Number(m[3]);
+  const fecha = new Date(y, mes - 1, d);
+  if (
+    Number.isNaN(fecha.getTime()) ||
+    fecha.getFullYear() !== y ||
+    fecha.getMonth() !== mes - 1 ||
+    fecha.getDate() !== d
+  ) {
+    throw new ErrorOrquestador(`Fecha inválida en --desde: "${desde}".`, SALIDA.ERROR_USO);
+  }
+  return fecha.toISOString();
 }
 
+const esObjeto = (e) => e !== null && typeof e === 'object' && !Array.isArray(e);
+
 export function calcularScorecard(eventos, registro, { desde, repo, raiz } = {}) {
+  const lista = Array.isArray(eventos) ? eventos.filter(esObjeto) : [];
   const desdeIso = desdeComoIso(desde);
   const enRepo = (e) => (!repo || e.repo === repo) && (!raiz || e.raiz === raiz);
-  const enRango = (e) => enRepo(e) && (!desdeIso || e.fecha >= desdeIso);
-  const delegaciones = eventos.filter((e) => e.tipo === 'delegacion' && enRango(e));
-  const escalamientos = eventos.filter((e) => e.tipo === 'escalamiento' && enRango(e));
-  const revision = mapaRevisiones(eventos);
+  const enRango = (e) => enRepo(e) && typeof e.fecha === 'string' && (!desdeIso || e.fecha >= desdeIso);
+  const delegaciones = lista.filter((e) => e.tipo === 'delegacion' && enRango(e));
+  const escalamientos = lista.filter((e) => e.tipo === 'escalamiento' && enRango(e));
+  const revision = mapaRevisiones(lista);
 
   const grupos = new Map();
   for (const d of delegaciones) {
@@ -78,7 +112,7 @@ export function calcularScorecard(eventos, registro, { desde, repo, raiz } = {})
 
   // Por tarea: cuántos intentos hicieron falta y cuántas terminaron escaladas. Se agrupan con todos sus
   // intentos (aunque alguno sea anterior a --desde) y se cuentan las tareas que empezaron en el rango.
-  const tareas = resumirTareas(eventos.filter((e) => ['revision', 'descarte'].includes(e.tipo) || enRepo(e)))
+  const tareas = resumirTareas(lista.filter((e) => ['revision', 'descarte'].includes(e.tipo) || enRepo(e)))
     .filter((t) => enRepo(t) && (!desdeIso || t.inicio >= desdeIso));
   const porRol = new Map();
   for (const t of tareas) {
@@ -110,10 +144,12 @@ export function calcularScorecard(eventos, registro, { desde, repo, raiz } = {})
     tokens_por_tarea: con_tokens ? tokens / con_tokens : null,
   }));
 
+  const minutosDelegados = delegaciones.reduce((s, d) => s + (d.duracion_ms ?? 0), 0) / 60000;
   const totales = {
     delegaciones: delegaciones.length,
     tareas: tareas.length,
-    minutos_command_code: delegaciones.reduce((s, d) => s + (d.duracion_ms ?? 0), 0) / 60000,
+    minutos_delegados: minutosDelegados,
+    minutos_command_code: minutosDelegados,
     tokens: delegaciones.some((d) => d.uso) ? delegaciones.reduce((s, d) => s + (tokensDe(d) ?? 0), 0) : null,
     costo: delegaciones.some((d) => d.uso?.costo !== null && d.uso?.costo !== undefined)
       ? delegaciones.reduce((s, d) => s + (d.uso?.costo ?? 0), 0) : null,
@@ -162,20 +198,39 @@ function tabla(cab, datos) {
   return [linea(cab), anchos.map((a) => '-'.repeat(a)).join('  '), ...datos.map(linea)].join('\n');
 }
 
-function imprimir({ filas, tareas, totales, escalamientos, sugerencias }, filtro) {
+function imprimir(
+  { filas, tareas, totales, escalamientos, sugerencias },
+  filtro,
+  { detalle = false, desde = null, repo = null, reposConocidos = [], faltaFase0Json = false } = {},
+) {
   if (!filas.length) {
     process.stdout.write(`Todavía no hay delegaciones registradas${filtro ? ` para ${filtro}` : ''}.\n`);
+    if (repo && reposConocidos.length) {
+      process.stdout.write(
+        reposConocidos.includes(repo)
+          ? `El repo "${repo}" tiene delegaciones registradas, pero ninguna coincide con los demás filtros.\n`
+          : `Repos con delegaciones registradas: ${reposConocidos.join(', ')}.\n`,
+      );
+    }
     return;
   }
   if (filtro) process.stdout.write(`Filtro: ${filtro}\n\n`);
-  process.stdout.write(`Por delegación\n${tabla(
-    ['Modelo', 'Rol', 'Effort', 'Skills', 'Repos', 'Deleg.', 'Revis.', 'Aprob.', '1er intento', 'Ajust.', 'Validar', 'Alertas', 'Críticas', 'Min. prom.', 'Tokens prom.'],
-    filas.map((f) => [
+  const cabDelegacion = detalle
+    ? ['Modelo', 'Rol', 'Effort', 'Skills', 'Repos', 'Deleg.', 'Revis.', 'Aprob.', '1er intento', 'Ajust.', 'Validar', 'Alertas', 'Críticas', 'Min. prom.', 'Tokens prom.']
+    : ['Modelo', 'Rol', 'Effort', 'Deleg.', 'Revis.', 'Aprob.', 'Validar', 'Min. prom.', 'Tokens prom.'];
+  const datosDelegacion = detalle
+    ? filas.map((f) => [
       f.modelo, f.rol, f.effort, f.skills, String(f.repos), String(f.delegaciones), String(f.revisadas),
       pct(f.tasa_aprobacion), pct(f.tasa_primer_intento), String(f.ajustadas), pct(f.tasa_validacion),
       String(f.con_alertas), String(f.con_criticas), num(f.duracion_media_min), miles(f.tokens_medios),
-    ]),
-  )}\n`);
+    ])
+    : filas.map((f) => [
+      f.modelo, f.rol, f.effort, String(f.delegaciones), String(f.revisadas),
+      pct(f.tasa_aprobacion), pct(f.tasa_validacion), num(f.duracion_media_min), miles(f.tokens_medios),
+    ]);
+  process.stdout.write(`Por delegación\n${tabla(cabDelegacion, datosDelegacion)}\n`);
+  if (!detalle) process.stdout.write('  (vista compacta; usa --detalle para ver las 15 columnas)\n');
+
   process.stdout.write(`\nPor tarea (intentos de una misma subtarea)\n${tabla(
     ['Rol', 'Tareas', 'Al 1er intento', 'Con reintento', 'Escaladas', 'Descartadas', 'Abiertas', 'Intentos/tarea', 'Min./tarea', 'Tokens/tarea'],
     tareas.map((t) => [
@@ -183,13 +238,18 @@ function imprimir({ filas, tareas, totales, escalamientos, sugerencias }, filtro
       String(t.descartadas), String(t.abiertas), num(t.intentos_por_tarea), num(t.min_por_tarea), miles(t.tokens_por_tarea),
     ]),
   )}\n`);
+  if (totales.delegaciones > 0 && tareas.length === 0 && desde) {
+    process.stdout.write('  (las delegaciones en el rango pertenecen a tareas iniciadas antes de --desde)\n');
+  }
   process.stdout.write(
-    `\nTotales: ${totales.delegaciones} delegaciones en ${totales.tareas} tareas · ${num(totales.minutos_command_code)} min de Command Code` +
+    `\nTotales: ${totales.delegaciones} delegaciones en ${totales.tareas} tareas · ${num(totales.minutos_delegados)} min delegados` +
       ` · tokens ${miles(totales.tokens)}${totales.costo !== null ? ` · costo ${totales.costo.toFixed(4)}` : ''}` +
       ` · ${totales.ajustadas} ajuste(s) manual(es) de Opus\n`,
   );
   if (totales.tokens === null) {
-    process.stdout.write('  (sin datos de tokens: activa la salida JSON con orq verificar --guardar)\n');
+    process.stdout.write(faltaFase0Json
+      ? '  (sin datos de tokens: activa la salida JSON con orq verificar --capacidades --guardar)\n'
+      : '  (sin datos de tokens en estas delegaciones)\n');
   }
   process.stdout.write(`Escalamientos a modelos nativos: ${escalamientos}\n`);
   process.stdout.write(sugerencias.length
@@ -197,21 +257,47 @@ function imprimir({ filas, tareas, totales, escalamientos, sugerencias }, filtro
     : '\nSin sugerencias de cambio.\n');
 }
 
-export async function ejecutar(argv) {
+export async function ejecutar(argv = []) {
   const { values } = parseArgs({
     args: argv,
     options: {
-      desde: { type: 'string' }, repo: { type: 'string' },
-      aqui: { type: 'boolean', default: false }, json: { type: 'boolean', default: false },
+      desde: { type: 'string' },
+      repo: { type: 'string' },
+      aqui: { type: 'boolean', default: false },
+      detalle: { type: 'boolean', default: false },
+      json: { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h', default: false },
     },
   });
-  if (values.desde && !/^\d{4}-\d{2}-\d{2}$/.test(values.desde)) throw new ErrorOrquestador('--desde debe tener formato AAAA-MM-DD.');
+  if (values.help) {
+    process.stdout.write(AYUDA);
+    return SALIDA.OK;
+  }
+  if (values.desde !== undefined) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(values.desde)) {
+      throw new ErrorOrquestador('--desde debe tener formato AAAA-MM-DD.', SALIDA.ERROR_USO);
+    }
+    desdeComoIso(values.desde);
+  }
   if (values.aqui && values.repo) throw new ErrorOrquestador('Usa --aqui o --repo, no ambos.');
   const raiz = values.aqui ? raizRepo() : undefined;
-  const resultado = calcularScorecard(leerJsonl(rutasLogs().jsonl), cargarRegistro(RUTA_REGISTRO), {
+  const eventos = leerJsonl(rutasLogs().jsonl);
+  const registro = cargarRegistro(RUTA_REGISTRO);
+  const resultado = calcularScorecard(eventos, registro, {
     desde: values.desde, repo: values.repo, raiz,
   });
   if (values.json) process.stdout.write(`${JSON.stringify(resultado, null, 2)}\n`);
-  else imprimir(resultado, [raiz && `repo ${raiz}`, values.repo && `repo ${values.repo}`, values.desde && `desde ${values.desde}`].filter(Boolean).join(', '));
+  else {
+    const reposConocidos = [...new Set(
+      eventos.filter((e) => e && e.tipo === 'delegacion' && typeof e.repo === 'string' && e.repo).map((e) => e.repo),
+    )].sort();
+    const usoCommandCode = resultado.filas.some((f) => f.ejecutor === 'command_code');
+    const faltaFase0Json = usoCommandCode && registro.command_code?.salida_json !== true;
+    imprimir(
+      resultado,
+      [raiz && `repo ${raiz}`, values.repo && `repo ${values.repo}`, values.desde && `desde ${values.desde}`].filter(Boolean).join(', '),
+      { detalle: values.detalle, desde: values.desde, repo: values.repo, reposConocidos, faltaFase0Json },
+    );
+  }
   return SALIDA.OK;
 }

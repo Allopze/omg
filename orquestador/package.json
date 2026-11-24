@@ -2,7 +2,7 @@
   "name": "orquestador-multimodelo",
   "version": "0.4.1",
   "private": true,
-  "description": "Claude Code (Opus) planifica y revisa; Command Code ejecuta con una whitelist de modelos.",
+  "description": "Claude Code (Opus) planifica y revisa; Command Code y Antigravity ejecutan con una whitelist de modelos.",
   "type": "module",
   "engines": {
     "node": ">=20"

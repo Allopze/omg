@@ -1,6 +1,6 @@
 ---
 name: analista-sonnet
-description: Escalamiento de solo lectura cuando Command Code agotó sus intentos en los roles explorar o analizar. Analiza el repo en profundidad sin modificarlo.
+description: "Escalamiento de solo lectura cuando los modelos delegados (`orq delegar`) agotaron sus intentos en los roles explorar o analizar. Analiza el repo en profundidad sin modificarlo."
 model: sonnet
 effort: medium
 tools: Read, Grep, Glob

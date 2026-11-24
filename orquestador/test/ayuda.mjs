@@ -13,13 +13,34 @@ export const AGY_FALSO = path.join(DIR, 'test', 'fixtures', 'agy-falso.mjs');
 export const SKILL = path.join(DIR, '..', 'skill', 'orquestar', 'SKILL.md');
 export const MAC = process.platform === 'darwin';
 
+const TEMPORALES = new Set();
+let limpiezaRegistrada = false;
+
+function limpiarTemporales() {
+  for (const ruta of TEMPORALES) {
+    try {
+      fs.rmSync(ruta, { recursive: true, force: true });
+    } catch { /* ignorar */ }
+  }
+  TEMPORALES.clear();
+}
+
+export function registrarTemporal(ruta) {
+  TEMPORALES.add(ruta);
+  if (!limpiezaRegistrada) {
+    limpiezaRegistrada = true;
+    process.on('exit', limpiarTemporales);
+  }
+  return ruta;
+}
+
 /**
  * orq corre con TMPDIR y HOME propios: así el sandbox solo deja escribir en el worktree y en ese
  * temporal, y se puede comprobar que bloquea el resto.
  */
 export function entorno({ editarRegistro = (y) => y, sandbox, agySettings = {}, base = os.tmpdir() } = {}) {
   fs.mkdirSync(base, { recursive: true });
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(base, 'orq-int-')));
+  const dir = registrarTemporal(fs.realpathSync(fs.mkdtempSync(path.join(base, 'orq-int-'))));
   const repo = path.join(dir, 'repo');
   const datos = path.join(dir, 'datos');
   const claude = path.join(dir, 'claude');
@@ -42,7 +63,7 @@ export function entorno({ editarRegistro = (y) => y, sandbox, agySettings = {}, 
   fs.writeFileSync(rutaAgySettings, JSON.stringify({ trustedWorkspaces: [], ...agySettings }));
   // Los falsos anotan sus llamadas en /tmp: es lo único escribible fuera del worktree y del temporal propio
   // de cada ejecución (el TMPDIR de orq ya no lo es).
-  const registros = fs.mkdtempSync(path.join('/tmp', 'orq-test-llamadas-'));
+  const registros = registrarTemporal(fs.mkdtempSync(path.join('/tmp', 'orq-test-llamadas-')));
   return {
     dir, repo, datos, claude, tmp, home,
     llamadas: path.join(registros, 'llamadas.jsonl'),
