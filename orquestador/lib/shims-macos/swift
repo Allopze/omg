@@ -1,0 +1,58 @@
+#!/bin/sh
+# Wrapper de swift (SwiftPM) dentro del sandbox-exec de orq (macOS).
+# Evita el sandbox-exec anidado de SwiftPM y de los plugins de macros en `swift build|test|run`.
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+REAL=""
+OLD_IFS=$IFS
+IFS=:
+for d in ${PATH:-}; do
+  [ -z "$d" ] && continue
+  [ "$d" = "$SELF_DIR" ] && continue
+  if [ -x "$d/swift" ] && [ ! -d "$d/swift" ]; then
+    REAL_DIR=$(CDPATH= cd -- "$d" 2>/dev/null && pwd || true)
+    [ "$REAL_DIR" = "$SELF_DIR" ] && continue
+    REAL="$d/swift"
+    break
+  fi
+done
+IFS=$OLD_IFS
+[ -n "$REAL" ] || REAL="/usr/bin/swift"
+
+if [ $# -eq 0 ]; then
+  exec "$REAL"
+fi
+
+case "$1" in
+  build|test|run)
+    sub=$1
+    shift
+    skip=0
+    has_ds=0
+    has_fe_ds=0
+    for arg in "$@"; do
+      case "$arg" in
+        --) break ;;
+        -h|--help|-help) skip=1 ;;
+        --disable-sandbox) has_ds=1 ;;
+        -disable-sandbox) has_fe_ds=1 ;;
+      esac
+    done
+    if [ "$skip" -eq 1 ]; then
+      exec "$REAL" "$sub" "$@"
+    fi
+    if [ "$has_ds" -eq 0 ] && [ "$has_fe_ds" -eq 0 ]; then
+      exec "$REAL" "$sub" --disable-sandbox -Xswiftc -Xfrontend -Xswiftc -disable-sandbox "$@"
+    elif [ "$has_ds" -eq 0 ]; then
+      exec "$REAL" "$sub" --disable-sandbox "$@"
+    elif [ "$has_fe_ds" -eq 0 ]; then
+      exec "$REAL" "$sub" -Xswiftc -Xfrontend -Xswiftc -disable-sandbox "$@"
+    fi
+    exec "$REAL" "$sub" "$@"
+    ;;
+  *)
+    exec "$REAL" "$@"
+    ;;
+esac

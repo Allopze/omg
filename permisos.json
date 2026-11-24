@@ -1,0 +1,28 @@
+{
+  "allow": [
+    "Bash(orq delegar *)",
+    "Bash(orq revision *)",
+    "Bash(orq validar *)",
+    "Bash(orq estado)",
+    "Bash(orq estado *)",
+    "Bash(orq scorecard)",
+    "Bash(orq scorecard *)",
+    "Bash(orq doctor)",
+    "Bash(git diff *)",
+    "Bash(git log *)",
+    "Bash(git status)",
+    "Bash(git status *)",
+    "Bash(git worktree list)"
+  ],
+  "deny": [
+    "Bash(cmd)",
+    "Bash(cmd *)",
+    "Bash(command-code *)",
+    "Bash(npx command-code *)",
+    "Bash(agy)",
+    "Bash(agy *)",
+    "Edit(~/.gemini/antigravity-cli/settings.json)",
+    "Edit(/{{ORQ_DIR}}/**)",
+    "Edit(./.claude/orquestador.yaml)"
+  ]
+}

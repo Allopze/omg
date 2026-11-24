@@ -1,0 +1,80 @@
+#!/bin/sh
+# Wrapper de xcodebuild dentro del sandbox-exec de orq (macOS).
+# macOS prohíbe anidar sandbox-exec (sandbox_apply devuelve EPERM), pero Swift lanza
+# swift-plugin-server (macros como @State/@Observable/#Preview) y Xcode lanza build scripts
+# dentro de su propio sandbox-exec. Como todo el proceso ya corre confinado por el sandbox
+# exterior de orq, desactivamos solo esos sub-sandboxes internos en acciones de compilación.
+set -eu
+
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+REAL=""
+OLD_IFS=$IFS
+IFS=:
+for d in ${PATH:-}; do
+  [ -z "$d" ] && continue
+  [ "$d" = "$SELF_DIR" ] && continue
+  if [ -x "$d/xcodebuild" ] && [ ! -d "$d/xcodebuild" ]; then
+    REAL_DIR=$(CDPATH= cd -- "$d" 2>/dev/null && pwd || true)
+    [ "$REAL_DIR" = "$SELF_DIR" ] && continue
+    REAL="$d/xcodebuild"
+    break
+  fi
+done
+IFS=$OLD_IFS
+[ -n "$REAL" ] || REAL="/usr/bin/xcodebuild"
+
+solo_consulta=0
+solo_clean=0
+compila=0
+for arg in "$@"; do
+  case "$arg" in
+    -version|-help|-usage|-list|-showsdks|-showdestinations|-showBuildSettings|-showBuildSettingsForIndex|\
+    -showTestPlans|-license|-checkFirstLaunchStatus|-runFirstLaunch|-exportArchive|-exportNotarizedApp|\
+    -exportLocalizations|-importLocalizations|-create-xcframework|-resolvePackageDependencies|\
+    -downloadPlatform|-downloadAllPlatforms|test-without-building)
+      solo_consulta=1
+      ;;
+    clean)
+      solo_clean=1
+      ;;
+    build|build-for-testing|analyze|archive|test|install|installsrc|docbuild)
+      compila=1
+      ;;
+  esac
+done
+
+if [ "$solo_consulta" -eq 1 ] || { [ "$solo_clean" -eq 1 ] && [ "$compila" -eq 0 ]; }; then
+  exec "$REAL" "$@"
+fi
+
+has_uss=0
+has_osf=0
+n=$#
+i=0
+while [ "$i" -lt "$n" ]; do
+  arg=$1
+  shift
+  i=$((i + 1))
+  case "$arg" in
+    ENABLE_USER_SCRIPT_SANDBOXING=*)
+      has_uss=1
+      set -- "$@" "$arg"
+      ;;
+    OTHER_SWIFT_FLAGS=*)
+      has_osf=1
+      case "$arg" in
+        *-disable-sandbox*) set -- "$@" "$arg" ;;
+        *) set -- "$@" "$arg -Xfrontend -disable-sandbox" ;;
+      esac
+      ;;
+    *)
+      set -- "$@" "$arg"
+      ;;
+  esac
+done
+
+[ "$has_uss" -eq 0 ] && set -- "$@" "ENABLE_USER_SCRIPT_SANDBOXING=NO"
+[ "$has_osf" -eq 0 ] && set -- "$@" 'OTHER_SWIFT_FLAGS=$(inherited) -Xfrontend -disable-sandbox'
+
+exec "$REAL" "$@"

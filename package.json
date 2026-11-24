@@ -1,0 +1,17 @@
+{
+  "name": "orquestador-multimodelo-global",
+  "version": "0.4.1",
+  "private": true,
+  "license": "MIT",
+  "description": "Paquete de instalación del orquestador multimodelo. El código instalable está en orquestador/.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allopze/omg.git"
+  },
+  "bin": {
+    "orquestador-multimodelo-global": "./instalar.mjs"
+  },
+  "scripts": {
+    "test": "cd orquestador && npm ci --no-audit --no-fund --loglevel=error && npm test && cd .. && node --test pruebas/*.test.mjs"
+  }
+}

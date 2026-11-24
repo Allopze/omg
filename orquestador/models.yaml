@@ -1,0 +1,219 @@
+# Registro global del orquestador multimodelo (~/.claude/orquestador/models.yaml).
+# Única fuente de verdad: `orq`, la skill `orquestar` y el scorecard leen este archivo.
+# Contiene los modelos delegables, que corren en un ejecutor: Command Code (`cmd`) o Antigravity CLI (`agy`).
+# Opus, Fable, Sonnet y Haiku se usan de forma nativa en Claude Code y se nombran como `nativo:<modelo>`
+# en los escalamientos.
+#
+# Cambios a la whitelist (models y permitidos): los aprueba el usuario, no Opus.
+# Cada repo puede ajustar effort, skills y límites, y declarar preparar/validar, en su .claude/orquestador.yaml (`orq init`).
+# El instalador solo lo actualiza si no lo modificaste; si lo modificaste, deja la versión nueva en models.yaml.nuevo.
+# Las claves que falten aquí (por ejemplo, si vienes de una versión anterior) toman su valor por defecto.
+
+# Detección automática de repos sensibles (datos clínicos o de clientes).
+# Un repo es sensible si su ruta o algún remoto de git coincide con un patrón (* y ? como comodines),
+# o si su .claude/orquestador.yaml dice sensible: true. Un repo no puede desmarcarse a sí mismo.
+# En un repo sensible, el router bloquea todo modelo cuyo `repos_sensibles` no sea `permitido`.
+repos_sensibles:
+  rutas: []      # ej. ["~/dev/cliente-*", "~/trabajo/privado/*"]
+  remotos: []    # ej. ["*cliente*", "*github.com*privado*"]
+
+# Ejecutor Command Code: los modelos sin `ejecutor` corren aquí.
+command_code:
+  bin: cmd
+  timeout_min: 30
+  # Lo completa `orq verificar --guardar` en la Fase 0:
+  #   true  -> el router pasa --skill a Command Code
+  #   false -> el router no pasa --skill y avisa a Opus que resuma las reglas en el prompt
+  #   null  -> sin verificar; el router se comporta como false
+  skills_compatibles: null
+  # También lo completa `orq verificar --guardar`:
+  #   true  -> el router pide --output-format json, guarda tokens por delegación (scorecard) y a Opus
+  #            solo le muestra la respuesta final de Command Code, no todo su progreso
+  #   false/null -> salida de texto, sin datos de tokens
+  salida_json: null
+
+# Ejecutor Antigravity CLI (`agy -p`, headless). Siempre entrega JSON con tokens; no recibe skills por flag.
+# Cada llamada tarda unos 40 s en arrancar y carga ~25 mil tokens de contexto propio de agy.
+# Autenticación (orq la detecta sola):
+#   API key de AI Studio -> "modelProvider": "gemini" en ~/.gemini/antigravity-cli/settings.json + GEMINI_API_KEY
+#   Proyecto de Google Cloud -> export AGY_ADC_AUTH=true (gcloud auth application-default login)
+#   Cuenta personal (el login de agy) -> el FAQ de Antigravity dice que envolver agy en otras aplicaciones
+#     "is not supported under consumer plans", y los términos prevén suspender las cuentas de Antigravity y
+#     Gemini CLI. Con false, orq bloquea los modelos de Antigravity cuando agy usa la cuenta personal.
+# permitir_cuenta_personal, sandbox.lectura_denegada y sandbox.lectura_extra son ajustes tuyos: el instalador
+# conserva su valor al actualizar este archivo y cambiarlos no cuenta como modificarlo.
+antigravity:
+  bin: agy
+  timeout_min: 30
+  permitir_cuenta_personal: true
+
+# Sandbox del sistema operativo para el ejecutor y para los comandos preparar/validar de cada repo
+# (sandbox-exec en macOS, bubblewrap en Linux). Dentro del sandbox solo puede escribir en su worktree,
+# en temporales, en cachés de paquetes (~/.npm, ~/.cache, …) y en el estado de su ejecutor
+# (~/.commandcode o ~/.gemini/antigravity-cli y ~/.gemini/antigravity, salvo su configuración);
+# no puede leer credenciales (~/.ssh, ~/.aws, ~/.config/gh, …) ni modificar .git. La red queda abierta.
+#   auto        -> usa el sandbox si está disponible; si no, avisa en el resumen de cada delegación
+#   obligatorio -> bloquea la delegación si no hay sandbox
+#   desactivado -> sin sandbox: el modelo delegado corre con todos tus permisos
+sandbox:
+  modo: auto
+  escritura_extra: []     # ej. ["~/Library/Application Support/mi-herramienta"]
+  # Carpetas que no se pueden leer: por defecto ~/dev, donde suelen estar los repos (cámbialo si los tienes
+  # en otra parte; [] desactiva la restricción). El repo de la tarea, su worktree y el estado del ejecutor
+  # se reabren aunque estén dentro; las credenciales quedan cerradas siempre.
+  lectura_denegada: ["~/dev"]    # ej. ["~/dev", "~/Documents"]
+  # Carpetas de solo lectura que se reabren dentro de lectura_denegada (p. ej. datos de referencia compartidos).
+  lectura_extra: []              # ej. ["~/dev/datos/referencias"]
+
+# Dónde se crean los worktrees de las delegaciones de escritura.
+#   repo    -> <repo>/.claude/worktrees/<id>, excluido en .git/info/exclude. Es lo más simple, pero
+#              herramientas como jest, tsc o eslint del checkout principal pueden recorrerlo.
+#   externa -> <dir_externo>/<repo>-<hash>/<id>, fuera del repo. Agrega dir_externo a
+#              permissions.additionalDirectories de Claude Code para que los subagentes editen ahí.
+worktrees:
+  ubicacion: repo
+  dir_externo: ~/.orquestador/worktrees
+
+models:
+  deepseek/deepseek-v4.1-flash-fast:
+    estado: activo            # activo | en_prueba | retirado
+    permisos: escritura       # lectura | escritura
+    repos_sensibles: tras_revisar_zdr   # permitido | tras_revisar_zdr | prohibido
+    efforts_aceptados: [off, low, high, max]  # default existe, pero el router no lo usa
+    fortalezas: "Alto throughput y visión; planes acotados con pasos claros"
+    debilidades: "Hipótesis: se desvía en refactors amplios o planes ambiguos"
+
+  # Modelos de Antigravity: `efforts` traduce cada nivel de effort de orq a un slug de `agy models`
+  # (agy codifica el effort en el slug). `max` solo se usa en reintentos (effort_reintento), así que el
+  # costo extra de xhigh aparece cuando el primer intento falló. Datos de noviembre de 2026: índice de
+  # Artificial Analysis y benchmarks de la página de modelos de Google DeepMind. En agy también están
+  # Gemini 4 Argon, Gemini 3.8 Flash, los Orchestrator, Claude y GPT-OSS.
+  antigravity/gemini-4-neon:
+    ejecutor: antigravity
+    estado: en_prueba
+    permisos: escritura
+    repos_sensibles: prohibido
+    efforts:
+      off: gemini-4-neon-low
+      low: gemini-4-neon-medium
+      high: gemini-4-neon-high
+      max: gemini-4-neon-xhigh
+    fortalezas: "El más capaz para código y agentes (Terminal-Bench 4.1: 65,2 %; índice AA 60-61); para tareas que DeepSeek no resuelve"
+    debilidades: "~100 tok/s y el más caro por token; más lento con xhigh; ~40 s de arranque de agy por llamada"
+
+  antigravity/gemini-4-hydrogen:
+    ejecutor: antigravity
+    estado: en_prueba
+    permisos: escritura
+    repos_sensibles: prohibido
+    efforts:
+      off: gemini-4-hydrogen-low
+      low: gemini-4-hydrogen-medium
+      high: gemini-4-hydrogen-high
+      max: gemini-4-hydrogen-xhigh
+    fortalezas: "Rápido y el más barato por tarea (~160 tok/s; índice AA 51-54, por encima de Argon); flujos agénticos del día a día"
+    debilidades: "Menos sólido que Neon en código difícil (Terminal-Bench 4.1: 57,0 %); ~40 s de arranque de agy por llamada"
+
+roles:
+  explorar:
+    descripcion: "Exploración amplia cuando el repo es demasiado grande para el subagente Explore (Haiku)"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: off
+    effort_reintento: low
+    escala_a: [nativo:sonnet]
+    max_intentos: 2
+    yolo: false
+    skills: []
+
+  analizar:
+    descripcion: "Análisis amplio de repo o contexto largo, solo lectura"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: low
+    effort_reintento: high
+    escala_a: [nativo:sonnet]
+    max_intentos: 2
+    yolo: false
+    skills: []
+
+  mecanico:
+    descripcion: "Cambios mecánicos: renombres, formato, ajustes repetitivos"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: off
+    effort_reintento: low
+    escala_a: [nativo:sonnet]
+    max_intentos: 2
+    yolo: true
+    max_archivos: 30
+    skills: []
+
+  implementar:
+    descripcion: "Implementar una fase de PLAN.md"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: high
+    effort_reintento: max
+    escala_a: [nativo:sonnet]
+    max_intentos: 2
+    yolo: true
+    max_archivos: 15
+    # Rutas relativas a la raíz del repo. Ejemplo:
+    # skills: [.claude/skills/convenciones-codigo, .claude/skills/tests]
+    skills: []
+
+  frontend:
+    descripcion: "Frontend desde mockup o captura"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: high
+    effort_reintento: max
+    escala_a: [nativo:sonnet]
+    max_intentos: 2
+    yolo: true
+    max_archivos: 15
+    skills: []
+
+  tests:
+    descripcion: "Escribir o completar tests"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: low
+    effort_reintento: high
+    escala_a: [nativo:sonnet]
+    max_intentos: 2
+    yolo: true
+    max_archivos: 15
+    skills: []
+
+  documentar:
+    descripcion: "Documentación y resúmenes, solo dentro de docs/"
+    primario: deepseek/deepseek-v4.1-flash-fast
+    permitidos: [deepseek/deepseek-v4.1-flash-fast, antigravity/gemini-4-neon, antigravity/gemini-4-hydrogen]
+    effort: off
+    effort_reintento: low
+    escala_a: [nativo:haiku]
+    max_intentos: 2
+    yolo: true
+    max_archivos: 20
+    rutas_permitidas: [docs/]
+    skills: []
+
+# Tareas que nunca se delegan (las hace Opus o un subagente nativo).
+no_delegables:
+  - "Plan y diseño"
+  - "Revisión del diff contra el plan"
+  - "Seguridad, auditoría y migraciones de datos"
+
+# Las sugerencias del scorecard. min_tareas y ultimas_tareas cuentan delegaciones revisadas (cada intento
+# cuenta); segundo_modelo mira la fracción de tareas que terminan escaladas a un subagente nativo.
+umbrales:
+  promocion:        # en_prueba -> activo
+    min_tareas: 5
+    tasa_aprobacion: 0.7
+  degradacion:      # activo -> en_prueba
+    ultimas_tareas: 10
+    tasa_aprobacion: 0.5
+  segundo_modelo:   # sugerir sumar otro modelo a la whitelist para un rol
+    tasa_escalamiento: 0.3

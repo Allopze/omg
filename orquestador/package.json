@@ -1,0 +1,19 @@
+{
+  "name": "orquestador-multimodelo",
+  "version": "0.4.1",
+  "private": true,
+  "description": "Claude Code (Opus) planifica y revisa; Command Code ejecuta con una whitelist de modelos.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  },
+  "bin": {
+    "orq": "bin/orq.mjs"
+  }
+}
